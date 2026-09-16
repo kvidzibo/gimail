@@ -18,6 +18,10 @@ class FakeIMAP:
         self.failure = None
         self.omit_store_ack = False
 
+    @property
+    def capabilities(self):
+        return tuple(self.advertised.decode('ascii').upper().split())
+
     def login(self, user, password):
         self.calls.append(('LOGIN', user, password))
         if self.failure == 'LOGIN':

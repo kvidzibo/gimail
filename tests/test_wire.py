@@ -1,4 +1,5 @@
 """Offline integration tests: real imaplib and CLI subprocesses on loopback."""
+import base64
 import json
 import os
 import socketserver
@@ -31,6 +32,11 @@ class Handler(socketserver.StreamRequestHandler):
             if command == b'CAPABILITY':
                 self.wfile.write(b'* CAPABILITY ' + self.server.capabilities + b'\r\n')
             elif command == b'LOGIN':
+                if self.server.auth_fail or b'LOGINDISABLED' in self.server.capabilities:
+                    status, message = b'NO', SECRET.encode()
+            elif command == b'AUTHENTICATE' and rest == b'PLAIN':
+                self.wfile.write(b'+ \r\n')
+                self.server.auth_payload = base64.b64decode(self.rfile.readline().strip(), validate=True)
                 if self.server.auth_fail:
                     status, message = b'NO', SECRET.encode()
             elif command in (b'EXAMINE', b'SELECT'):
@@ -57,14 +63,15 @@ class Handler(socketserver.StreamRequestHandler):
                         flags = b' '.join(self.server.flags[uid])
                         # Exercise metadata after a literal, not only the common UID-first order.
                         self.wfile.write(b'* 2 FETCH (BODY[] {' + str(len(content)).encode() + b'}\r\n' + content
-                                         + b' UID ' + uid_text + b' FLAGS (' + flags + b') RFC822.SIZE 456)\r\n')
+                                         + b' FLAGS (' + flags + b') UID ' + uid_text + b' RFC822.SIZE 456)\r\n')
                     elif operation == b'STORE' and uid in self.server.flags:
                         mode, value = details.split(b' ', 1)
                         flag = value.strip(b'()')
-                        if mode == b'+FLAGS':
-                            self.server.flags[uid].add(flag)
-                        else:
-                            self.server.flags[uid].discard(flag)
+                        if not self.server.ignore_store:
+                            if mode == b'+FLAGS':
+                                self.server.flags[uid].add(flag)
+                            else:
+                                self.server.flags[uid].discard(flag)
                         self.wfile.write(b'* 2 FETCH (FLAGS (' + b' '.join(self.server.flags[uid]) + b') UID ' + uid_text + b')\r\n')
                     elif operation in (b'MOVE', b'COPY'):
                         if details == b'"Missing"':
@@ -99,7 +106,8 @@ class WireTests(unittest.TestCase):
         self.server.capabilities = b'IMAP4rev1 MOVE UIDPLUS'
         self.server.commands, self.server.copies = [], []
         self.server.flags = {7: set(), 42: {b'\\Seen'}, 99: {b'\\Deleted'}}
-        self.server.auth_fail = self.server.abort_search = False
+        self.server.auth_fail = self.server.abort_search = self.server.ignore_store = False
+        self.server.auth_payload = None
         self.thread = threading.Thread(target=self.server.serve_forever, kwargs={'poll_interval': 0.01}, daemon=True)
         self.thread.start()
         self.addCleanup(self.stop_server)
@@ -209,6 +217,36 @@ class WireTests(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertEqual(result['code'], 'auth_failed')
         self.assertNotIn(SECRET, json.dumps(result))
+
+    def test_ascii_authenticate_plain_when_login_disabled(self):
+        self.server.capabilities += b' AUTH=PLAIN LOGINDISABLED'
+        status, result = self.invoke('account', 'test')
+        self.assertEqual(status, 0)
+        self.assertTrue(result['data']['connected'])
+        self.assertIn(b'AUTHENTICATE PLAIN\r\n', self.wire())
+        self.assertNotIn(b' LOGIN ', self.wire())
+        self.assertEqual(self.server.auth_payload, b'\0' + self.env['GIMAIL_USER'].encode() + b'\0' + SECRET.encode())
+
+    def test_flag_keywords_cannot_spoof_uid_or_message_size(self):
+        self.server.flags[7] = {b'UID', b'42', b'RFC822.SIZE', b'999', b'\\Seen'}
+        status, result = self.invoke('show', '7')
+        self.assertEqual(status, 0)
+        self.assertEqual(result['data']['uid'], 7)
+        self.assertEqual(result['data']['size'], 456)
+        self.assertFalse(result['data']['unread'])
+
+    def test_ignored_store_returns_error_and_fallback_move_does_not_expunge(self):
+        self.server.capabilities = b'IMAP4rev1 UIDPLUS'
+        self.server.ignore_store = True
+        for args in (('mark', '7', '--read'), ('delete', '7'), ('move', '7', 'Archive')):
+            with self.subTest(args=args):
+                status, result = self.invoke(*args, '--confirm')
+                self.assertEqual(status, 1)
+                self.assertEqual(result['code'], 'imap_error')
+                self.assertIn('did not apply', result['error'])
+        self.assertNotIn(b'EXPUNGE', self.wire())
+        self.assertNotIn(b'\\Deleted', self.server.flags[7])
+        self.assertNotIn(b'\\Seen', self.server.flags[7])
 
     def test_aborted_search_returns_imap_error(self):
         self.server.abort_search = True

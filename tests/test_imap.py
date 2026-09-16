@@ -110,6 +110,14 @@ class ImapTests(unittest.TestCase):
         self.assertIn(('AUTHENTICATE', 'PLAIN', '\0mé@example.org\0sëcret'.encode()), self.fake.calls)
         self.assertFalse(any(call[0] == 'LOGIN' for call in self.fake.calls))
 
+    def test_ascii_credentials_use_plain_when_login_is_disabled(self):
+        self.fake.advertised = b'IMAP4rev1 LOGINDISABLED AUTH=PLAIN'
+        self.fake.failure = 'LOGIN'
+        with MailClient(self.account):
+            pass
+        self.assertIn(('AUTHENTICATE', 'PLAIN', b'\0me\0secret-value'), self.fake.calls)
+        self.assertFalse(any(call[0] == 'LOGIN' for call in self.fake.calls))
+
     def test_structured_search_quoting_unicode_and_raw_query(self):
         with MailClient(self.account) as client:
             client.select()
@@ -151,6 +159,19 @@ class ImapTests(unittest.TestCase):
         self.assertFalse(data['unread'])
         self.assertEqual(data['size'], 456)
 
+    def test_fetch_keywords_cannot_spoof_uid_or_size_attributes(self):
+        response = ('OK', [
+            (b'2 (FLAGS (UID 42 RFC822.SIZE 999 \\Seen) UID 7 RFC822.SIZE 456 BODY[] {10}', HEADERS),
+            b')',
+        ])
+        with MailClient(self.account) as client:
+            client.select()
+            with patch.object(self.fake, 'uid', return_value=response):
+                data = client.fetch(7)
+        self.assertEqual(data['uid'], 7)
+        self.assertEqual(data['size'], 456)
+        self.assertFalse(data['unread'])
+
     def test_folder_missing(self):
         with MailClient(self.account) as client:
             with self.assertRaises(GimailError) as caught:
@@ -186,6 +207,23 @@ class ImapTests(unittest.TestCase):
         self.assertTrue(result['expunge_requested'])
         self.assertIn(('MOVE', '7', '"Archive Stuff"'), self.fake.calls)
         self.assertFalse(any(call[0] in ('COPY', 'STORE', 'EXPUNGE') for call in self.fake.calls))
+
+    def test_failed_native_move_does_not_retry_with_copy(self):
+        self.fake.failure = 'MOVE'
+        with MailClient(self.account) as client:
+            client.select(readonly=False)
+            with self.assertRaises(GimailError):
+                client.mutate('move', 7, confirm=True, destination='Archive')
+        self.assertFalse(any(call[0] in ('COPY', 'STORE', 'EXPUNGE') for call in self.fake.calls))
+
+    def test_failed_uid_expunge_warns_about_partial_move(self):
+        self.fake.advertised = b'IMAP4rev1 UIDPLUS'
+        self.fake.failure = 'EXPUNGE'
+        with MailClient(self.account) as client:
+            client.select(readonly=False)
+            with self.assertRaisesRegex(GimailError, 'copied and source marked Deleted'):
+                client.mutate('move', 7, confirm=True, destination='Archive')
+        self.assertIn(r'\Deleted', self.fake.flags[7])
 
     def test_move_fallback_scopes_expunge_with_uidplus(self):
         self.fake.advertised = b'IMAP4rev1 UIDPLUS'
@@ -229,6 +267,29 @@ class ImapTests(unittest.TestCase):
             client.select(readonly=False)
             with self.assertRaisesRegex(GimailError, 'did not acknowledge'):
                 client.mutate('mark', 7, confirm=True, read=True)
+
+    def test_store_ignored_flags_cannot_report_success_or_expunge(self):
+        original_uid = self.fake.uid
+        self.fake.advertised = b'IMAP4rev1 UIDPLUS'
+
+        def ignored_store(command, *args):
+            if command == 'STORE':
+                self.fake.calls.append((command, *args))
+                flags = ' '.join(self.fake.flags[7])
+                return 'OK', [f'2 (UID 7 FLAGS ({flags}))'.encode()]
+            return original_uid(command, *args)
+
+        with MailClient(self.account) as client:
+            client.select(readonly=False)
+            for action, read in (('mark', True), ('mark', False), ('delete', None), ('move', None)):
+                self.fake.flags[7] = [r'\Seen'] if read is False else []
+                with self.subTest(action=action, read=read), patch.object(self.fake, 'uid', side_effect=ignored_store):
+                    with self.assertRaises(GimailError) as caught:
+                        client.mutate(action, 7, confirm=True, read=read, destination='Archive')
+                    self.assertEqual(caught.exception.code, 'imap_error')
+                    if action == 'move':
+                        self.assertIn('copied', str(caught.exception))
+        self.assertFalse(any(call[0] == 'EXPUNGE' for call in self.fake.calls))
 
     def test_move_to_same_folder_rejected(self):
         with MailClient(self.account) as client:

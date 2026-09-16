@@ -3,17 +3,15 @@ from __future__ import annotations
 
 import base64
 import imaplib
-import re
 import ssl
 from email import policy
 from email.parser import BytesParser
 
 from .accounts import clean_string
 from .errors import GimailError
+from .imap_response import START, fetch_metadata
 
 
-UID_RE = re.compile(rb"\bUID\s+(\d+)\b", re.I)
-SIZE_RE = re.compile(rb"\bRFC822\.SIZE\s+(\d+)\b", re.I)
 NETWORK_ERRORS = (imaplib.IMAP4.error, OSError, EOFError, UnicodeError, ValueError)
 
 
@@ -54,7 +52,7 @@ def fetch_responses(data):
             header, literal = item, None
         if not isinstance(header, bytes):
             continue
-        if headers and re.match(rb"^\d+\s+\(", header):
+        if headers and START.match(header):
             yield b" ".join(headers), literals
             headers, literals = [], []
         headers.append(header)
@@ -77,8 +75,10 @@ def decoded_payload(part):
 
 def message_data(uid, header, content, include_body=False):
     msg = BytesParser(policy=policy.default).parsebytes(content)
-    flags = [flag.decode("ascii", "replace") for flag in imaplib.ParseFlags(header)]
-    size_match = SIZE_RE.search(header)
+    metadata = fetch_metadata(header)
+    flags = metadata["flags"]
+    if flags is None:
+        raise GimailError("Server omitted requested message flags.")
     result = {
         "uid": uid,
         "subject": str(msg.get("Subject", "")),
@@ -89,7 +89,7 @@ def message_data(uid, header, content, include_body=False):
         "message_id": str(msg.get("Message-ID", "")),
         "flags": flags,
         "unread": not any(flag.lower() == r"\seen" for flag in flags),
-        "size": int(size_match.group(1)) if size_match else len(content),
+        "size": metadata["size"] if metadata["size"] is not None else len(content),
     }
     if include_body:
         texts, htmls, attachments = [], [], []
@@ -141,15 +141,16 @@ class MailClient:
             self.connection.debug = 0
             try:
                 # Old imaplib versions do not quote the LOGIN username themselves.
-                if self.account.user.isascii() and password.isascii():
+                login_disabled = "LOGINDISABLED" in self.connection.capabilities
+                if self.account.user.isascii() and password.isascii() and not login_disabled:
                     self._call(self.connection.login, quote(self.account.user), password,
                                message="Authentication failed. Check username and password (Gmail requires an App Password).",
                                code="auth_failed")
                 else:
-                    # SASL PLAIN supports UTF-8 credentials and avoids LOGIN's ASCII encoding.
+                    # SASL PLAIN also serves servers that disable LOGIN entirely.
                     self._call(self.connection.authenticate, "PLAIN",
                                lambda _: b"\0" + self.account.user.encode("utf-8") + b"\0" + password.encode("utf-8"),
-                               message="Authentication failed; non-ASCII credentials require AUTH=PLAIN support.",
+                               message="Authentication failed; non-ASCII credentials or disabled LOGIN require AUTH=PLAIN support.",
                                code="auth_failed")
             finally:
                 password = None
@@ -247,18 +248,25 @@ class MailClient:
         data = self._call(self.connection.uid, "FETCH", str(uid), f"(UID FLAGS RFC822.SIZE {fields})",
                           message="Could not fetch message.")
         for header, literals in fetch_responses(data):
-            match = UID_RE.search(header)
-            if match and int(match.group(1)) == uid and literals:
+            if fetch_metadata(header)["uid"] == uid and literals:
                 return message_data(uid, header, literals[0], include_body)
         raise GimailError("Message UID not found in this folder.", "not_found")
 
     def _store(self, uid, operation, flag, message):
         data = self._call(self.connection.uid, "STORE", str(uid), operation, "(" + flag + ")", message=message)
-        for header, _ in fetch_responses(data):
-            match = UID_RE.search(header)
-            if match and int(match.group(1)) == uid:
-                return
-        raise GimailError(message + " Server did not acknowledge this UID; the message may have disappeared.")
+        flags = None
+        try:
+            for header, _ in fetch_responses(data):
+                metadata = fetch_metadata(header)
+                if metadata["uid"] == uid and metadata["flags"] is not None:
+                    flags = metadata["flags"]
+        except GimailError:
+            raise GimailError(message + " Server returned invalid flag metadata.") from None
+        if flags is None:
+            raise GimailError(message + " Server did not acknowledge this UID; the message may have disappeared.")
+        present = flag.lower() in (value.lower() for value in flags)
+        if present != (operation == "+FLAGS"):
+            raise GimailError(message + " Server did not apply the requested flag change.")
 
     def mutate(self, action, uid, confirm=False, read=None, destination=None):
         if action == "move":

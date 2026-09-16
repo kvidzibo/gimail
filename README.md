@@ -106,7 +106,7 @@ gimail account test work
 gimail list --account work --unread --limit 5
 ```
 
-`ssl` verifies the certificate and hostname. `starttls` requires a successful verified TLS upgrade **before** credentials are sent; there is no silent fallback. Use a system-trusted CA (or Python/OpenSSL's `SSL_CERT_FILE` for a private CA). `plain` is an explicit insecure opt-in for a local test server or a transport you already secure: **it sends credentials and mail unencrypted**. Network operations have a 30-second socket timeout.
+`ssl` verifies the certificate and hostname. `starttls` requires a successful verified TLS upgrade **before** credentials are sent; there is no silent fallback. Use a system-trusted CA (or Python/OpenSSL's `SSL_CERT_FILE` for a private CA). `plain` is an explicit insecure opt-in for a local test server or a transport you already secure: **it sends credentials and mail unencrypted**. Network operations have a 30-second socket timeout. Authentication uses LOGIN for ASCII credentials, or SASL PLAIN for non-ASCII credentials and servers advertising `LOGINDISABLED`; those cases require server support for `AUTH=PLAIN`.
 
 ## Commands
 
@@ -144,7 +144,7 @@ gimail delete 314 --confirm --account work              # set Deleted
 ```
 
 - UIDs are **not sequence numbers**. They are scoped to an account, source folder, and `uidvalidity`, which is included in mail results. Re-list after a folder is recreated or UIDVALIDITY changes. A move assigns a new UID in the destination. UID sets, ranges, and `*` are deliberately rejected.
-- List/search return newest **UID** first (not sorted by the Date header), with a default limit of 20. Filters are ANDed. `--query` accepts raw single-line IMAP **search criteria**, not an entire command. Quote it for your shell. Non-ASCII searches request UTF-8; server charset support varies.
+- List/search return newest **UID** first (not sorted by the Date header), with a default limit of 20. Filters are ANDed. `--query` accepts raw single-line IMAP **search criteria**, not an entire command. Quote it for your shell. Non-ASCII searches request UTF-8 using quoted strings. Strict IMAP4rev1 servers requiring literals may reject them even when they support UTF-8; literal search arguments are not yet implemented.
 - Unicode mailbox names use IMAP modified UTF-7. Use the server's exact folder path and delimiter. Move does not create folders.
 - List/search fetch headers only. Show fetches the whole message, decodes MIME text/HTML and headers, and reports attachment metadata, not attachment contents. HTML is returned as text, never rendered. All reads use a read-only mailbox and `BODY.PEEK`, so they do not set `Seen`.
 
@@ -155,6 +155,7 @@ gimail delete 314 --confirm --account work              # set Deleted
 - `delete` sets the IMAP `\Deleted` flag only. **It does not request expunge.** This is not a guaranteed move to Trash or permanent deletion. Other clients and server policies may subsequently purge it; Gmail's auto-expunge/label settings can change the effect. To put a message in Trash, use `move` with your server's actual Trash folder.
 - `move` uses `UID MOVE` when available. Otherwise, it copies, then marks only the source UID Deleted. With UIDPLUS it expunges **that UID only**. Without MOVE or UIDPLUS, the copied source remains marked Deleted, and the response includes a note.
 - gimail never issues mailbox-wide EXPUNGE or CLOSE, which could remove other clients' deleted messages. It logs out without implicitly expunging the mailbox.
+- STORE acknowledgements must include the target UID and flags reflecting the requested change. Ignored flag changes return an error; a fallback move stops before expunge if setting Deleted was not acknowledged.
 - A timeout or failed fallback can leave a partial change. Errors warn you to inspect the source and destination before retrying; blindly retrying a copy can create duplicates. `expunge_requested` describes the client's request, not a guarantee about server retention policies.
 - New `account add` operations write config immediately but refuse duplicate names; they never overwrite an existing account.
 
@@ -208,7 +209,7 @@ Default: `~/.config/gimail/accounts.json`, or `$XDG_CONFIG_HOME/gimail/accounts.
 
 See [`examples/accounts.json`](examples/accounts.json) for Gmail and generic STARTTLS examples. Saved accounts need `name`, `host`, `user`, and exactly one of `password_env` or `password`. Optional `security` defaults to `ssl`; `port` defaults to 993 for SSL and 143 otherwise. `default_account` is optional.
 
-`account add` creates the directory with mode `700` and atomically writes the file with mode **`600`**. Existing files must be owned by you, regular (not symlinks), and inaccessible to group/other users. A manually created file needs:
+`account add` creates the directory with mode `700` and atomically writes the file with mode **`600`**. Existing directory permissions are left unchanged; keep that directory private. Existing files must be owned by you, regular (not symlinks), and inaccessible to group/other users. A manually created file needs:
 
 ```sh
 chmod 600 ~/.config/gimail/accounts.json
@@ -227,7 +228,7 @@ python3 -m venv --without-pip .venv
 
 The tests use fake IMAP connections and a loopback test server with real `imaplib`/CLI subprocesses. They need no mail account, secrets, or internet and do not touch your real config. CI runs the same suite on Python 3.9, 3.11, and 3.14. Live Gmail/generic-server access is not part of the offline suite; use `account test` with your own credentials.
 
-Code lives in `gimail/`: `accounts.py` (private config), `imap_client.py` (protocol/MIME), and `cli.py` (arguments/output). `gimail.py` and `gimail/__main__.py` are entry points. Contributions should include focused stdlib `unittest` coverage, especially for changes to mutation safety.
+Code lives in `gimail/`: `accounts.py` (private config), `imap_client.py` (protocol/MIME), `imap_response.py` (structured FETCH metadata), and `cli.py` (arguments/output). `gimail.py` and `gimail/__main__.py` are entry points. Contributions should include focused stdlib `unittest` coverage, especially for changes to mutation safety.
 
 ## License
 
