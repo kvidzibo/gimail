@@ -16,6 +16,14 @@
       "user": "you@example.org",
       "security": "starttls",
       "password_env": "WORK_IMAP_PASSWORD"
+    },
+    {
+      "name": "desktop",
+      "host": "imap.example.net",
+      "port": 993,
+      "user": "you@example.net",
+      "security": "ssl",
+      "password_keyring": true
     }
   ]
 }

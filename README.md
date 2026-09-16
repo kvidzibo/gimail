@@ -6,6 +6,7 @@ A small, scriptable IMAP client for humans and AI agents. **Python standard libr
 - SSL with certificate verification by default; STARTTLS and explicit plaintext IMAP supported.
 - UID-based list, show, search, mark, move, and delete.
 - Saved account add/update/remove, with a numbered terminal picker for removal.
+- Optional GNOME Keyring / Seahorse credentials, retrieved internally without agent-side shell wrappers.
 - Mail changes and account update/remove are previews until you pass `--confirm`.
 
 ## Install
@@ -107,6 +108,51 @@ gimail list --account work --unread --limit 5
 
 `ssl` verifies the certificate and hostname. `starttls` requires a successful verified TLS upgrade **before** credentials are sent; there is no silent fallback. Use a system-trusted CA (or Python/OpenSSL's `SSL_CERT_FILE` for a private CA). `plain` is an explicit insecure opt-in for a local test server or a transport you already secure: **it sends credentials and mail unencrypted**. Network operations have a 30-second socket timeout. Authentication uses LOGIN for ASCII credentials, or SASL PLAIN for non-ASCII credentials and servers advertising `LOGINDISABLED`; those cases require server support for `AUTH=PLAIN`.
 
+### GNOME Keyring / Seahorse (optional)
+
+Gimail can retrieve a saved account's password from **GNOME Keyring** itself. **Seahorse** is the GUI for managing/unlocking the keyring; gimail calls libsecret's `secret-tool` internally. No Python packages are needed. Environment/stored-password accounts do not require this helper.
+
+On a Debian desktop, install these system packages if needed:
+
+```sh
+sudo apt install gnome-keyring libsecret-tools seahorse
+```
+
+**One-time secret setup**, in your own terminal:
+
+```sh
+secret-tool store --label='gimail personal' service gimail account personal
+```
+
+Enter your IMAP password at the prompt (a Gmail **App Password** for Gmail), never as a command-line argument. This creates or updates the matching entry; it does not change your provider's password. It appears in Seahorse as `gimail personal`. The lookup attributes are **`service=gimail`** and **`account=<saved profile name>`**. The label is just for display: a manually created item with the same label but different attributes will not match. Use the corresponding profile name for other accounts. These keys do not include the config path, host, or login username: profiles with the same name share an entry. Use distinct profile names when credentials differ.
+
+Then opt an **existing profile** into keyring authentication:
+
+```sh
+gimail account update personal --keyring          # preview
+gimail account update personal --keyring --confirm
+```
+
+Or choose keyring when creating a **new profile**:
+
+```sh
+gimail account add personal --preset gmail --user you@gmail.com --keyring
+```
+
+After setup, **humans and agents use ordinary commands**—no password exports, command substitution, or special agent rules:
+
+```sh
+gimail account test personal
+gimail --account personal list --unread --limit 5
+gimail --account personal show 314
+```
+
+- `--keyring` saves only `"password_keyring": true`; it replaces another credential source but does not create, copy, update, or delete a keyring entry. Account add/list/update/remove—including previews—never query the keyring. Switching away or removing a profile leaves its keyring entry alone.
+- Gimail looks up the password only when authenticating. The helper's stdout is captured internally and stderr discarded; credentials are never added to command arguments, config, or normal CLI output. Spaces are preserved exactly; invalid UTF-8 and unsupported password control characters are rejected, not trimmed.
+- The keyring must be accessible in the process's desktop/user D-Bus session. Unlock it in Seahorse first. A locked keyring may request an interactive unlock; lookup times out after **15 seconds** with `auth_failed`. Missing helper, missing entry, or session/access failure also returns `auth_failed`, with no credential fallback.
+- SSH, cron, containers, and agents running as another user do not automatically have access to your desktop keyring. Configure an appropriate session/credential source instead of disabling keyring protection. Keyring storage is not a sandbox against processes running as your user.
+- The helper is resolved from `PATH`; use a trusted `secret-tool` installation. Keyring support is optional and requires no changes to generic IMAP authentication or TLS behavior. Use explicit `--account personal` to avoid an old environment-only configuration taking precedence.
+
 ### Update or remove saved accounts
 
 These operations edit only the local accounts config; they never connect to IMAP. Both preview by default and require `--confirm` to save changes.
@@ -140,8 +186,8 @@ Choose index (Enter, 0, or q cancels): 2
 - The list and prompt go to **stderr**; stdout remains one JSON result, or `--text` output. The picker requires terminal stdin and stderr. With redirected input or in a script, pass `NAME` (or `--account NAME` for removal); an omitted name returns an error instead of waiting for input.
 - Enter, `0`, `q`, or EOF while choosing cancels without changes and returns `cancelled: true`. Ctrl-C while choosing exits `130`. An invalid index is an argument error, not a removal.
 - Update requires an explicit `NAME`; removal accepts `NAME`, `--account NAME`, or the picker. `GIMAIL_ACCOUNT` and environment-only setup do not implicitly choose a profile to update/remove. If both a name and `--account` are supplied, they must match. An explicitly empty name is an error, never a fallback to another account.
-- Update supports `--host`, `--port`, `--user`, `--security`, `--password-env`, `--password-stdin`, and `--default`. Omitted fields stay unchanged: changing security alone does **not** change the port. No field options means an argument error; reapplying existing values is a successful no-op with `changed_fields: []`.
-- `--password-env` takes a **variable name, not the password**. It replaces any stored password; `--password-stdin` replaces the environment reference with a plaintext password. The latter consumes one input line even for a preview. Update results list changed field names, never credential values.
+- Update supports `--host`, `--port`, `--user`, `--security`, `--password-env`, `--password-stdin`, `--keyring`, and `--default`. Omitted fields stay unchanged: changing security alone does **not** change the port. No field options means an argument error; reapplying existing values is a successful no-op with `changed_fields: []`.
+- `--password-env` takes a **variable name, not the password**. Credential options are mutually exclusive: `--password-env`, `--password-stdin`, or `--keyring` replaces the previous source. `--password-stdin` stores plaintext in the config, not in the keyring. `--password-stdin` consumes one input line even for a preview. Update results list changed field names, never credential values.
 - Removing the default selects the first remaining saved account. Removing the last leaves a valid empty `accounts` array. Other profiles are retained, and the removed name can be added again.
 - Removal does not delete mail, unset your shell variables, delete keyring entries, or revoke provider passwords. If the selected profile changes while the picker is open, removal stops and asks you to retry; reordering accounts cannot redirect a displayed index to a different profile.
 
@@ -149,11 +195,11 @@ Choose index (Enter, 0, or q cancels): 2
 
 ```text
 gimail account add NAME (--host HOST | --preset gmail) --user USER
-                   (--password-env VARIABLE | --password-stdin)
+                   (--password-env VARIABLE | --password-stdin | --keyring)
                    [--port PORT] [--security ssl|starttls|plain] [--default]
 gimail account update NAME [--host HOST] [--port PORT] [--user USER]
                       [--security ssl|starttls|plain]
-                      [--password-env VARIABLE | --password-stdin] [--default] [--confirm]
+                      [--password-env VARIABLE | --password-stdin | --keyring] [--default] [--confirm]
 gimail account remove [NAME] [--confirm]
 gimail account list
 gimail account test [NAME]
@@ -248,7 +294,7 @@ Default: `~/.config/gimail/accounts.json`, or `$XDG_CONFIG_HOME/gimail/accounts.
 }
 ```
 
-See [`examples/accounts.json`](examples/accounts.json) for Gmail and generic STARTTLS examples. Saved accounts need `name`, `host`, `user`, and exactly one of `password_env` or `password`. Optional `security` defaults to `ssl`; `port` defaults to 993 for SSL and 143 otherwise. `default_account` is optional.
+See [`examples/accounts.json`](examples/accounts.json) for Gmail and generic STARTTLS examples. Saved accounts need `name`, `host`, `user`, and exactly one credential source: `password_env`, `password`, or `password_keyring: true`. `password_keyring` must be a JSON boolean; `false` does not define a credential source. Optional `security` defaults to `ssl`; `port` defaults to 993 for SSL and 143 otherwise. `default_account` is optional.
 
 `account add` creates the directory with mode `700` and atomically writes the file with mode **`600`**. Existing directory permissions are left unchanged; keep that directory private. Existing files must be owned by you, regular (not symlinks), and inaccessible to group/other users. A manually created file needs:
 
@@ -256,20 +302,20 @@ See [`examples/accounts.json`](examples/accounts.json) for Gmail and generic STA
 chmod 600 ~/.config/gimail/accounts.json
 ```
 
-`password_env` is preferred; a missing or empty variable is an authentication error, with no credential fallback. Plaintext `password` is supported in a private config, or can be read by `account add` / `account update` with `--password-stdin` (one line). There is deliberately no `--password VALUE` flag. Secrets are never included in account listings, previews, or errors. Do not commit real account files; the example contains placeholders only. CLI config writers coordinate through an adjacent `accounts.json.lock` file (mode `600`, no credentials). A concurrent writer fails with a busy error rather than overwriting another change; retry after it finishes. The lock is released on exit, but its empty file stays in place. Previews and picker prompts do not acquire a write lock. Do not delete the lock file or manually edit the config while a writer is running.
+Prefer `password_env` or `password_keyring: true` over plaintext storage. A missing or empty credential is an authentication error, with no credential fallback. Keyring profiles store only the boolean flag and use the fixed attributes documented above. Plaintext `password` is supported in a private config, or can be read by `account add` / `account update` with `--password-stdin` (one line). There is deliberately no `--password VALUE` flag. Secrets are never included in account listings, previews, or errors. Do not commit real account files; the example contains placeholders only. CLI config writers coordinate through an adjacent `accounts.json.lock` file (mode `600`, no credentials). A concurrent writer fails with a busy error rather than overwriting another change; retry after it finishes. The lock is released on exit, but its empty file stays in place. Previews and picker prompts do not acquire a write lock. Do not delete the lock file or manually edit the config while a writer is running.
 
 ## Development
 
-Runtime dependencies: none. For an isolated, pip-free development environment:
+Python package dependencies: none. The optional `--keyring` backend needs the system `secret-tool` executable and an accessible Secret Service keyring. For an isolated, pip-free development environment:
 
 ```sh
 python3 -m venv --without-pip .venv
 .venv/bin/python -m unittest discover -v
 ```
 
-The tests use fake IMAP connections, a loopback test server with real `imaplib`/CLI subprocesses, and pseudo-terminals for the numbered picker. Picker tests exercise stdout/stderr separation, cancellation, and changes to the config while the user is choosing. CI runs terminal UI tests under `xvfb-run`; no display is required by the CLI itself. They need no mail account, secrets, or internet and do not touch your real config. CI runs the same suite on Python 3.9, 3.11, and 3.14. Live Gmail/generic-server access is not part of the offline suite; use `account test` with your own credentials.
+The tests use fake IMAP connections, a loopback test server with real `imaplib`/CLI subprocesses, and pseudo-terminals for the numbered picker. Picker tests exercise stdout/stderr separation, cancellation, and changes to the config while the user is choosing. CI runs terminal UI tests under `xvfb-run`; no display is required by the CLI itself. Keyring tests use disposable fake `secret-tool` executables and an inaccessible test D-Bus address, never the real desktop keyring. They verify internal credential retrieval through real CLI/IMAP subprocesses, timeout cleanup, and output secrecy. Tests need no mail account, keyring, secrets, or internet and do not touch your real config. CI runs the same suite on Python 3.9, 3.11, and 3.14. Live Gmail/generic-server access is not part of the offline suite; use `account test` with your own credentials.
 
-Code lives in `gimail/`: `accounts.py` (private config), `imap_client.py` (protocol/MIME), `imap_response.py` (structured FETCH metadata), and `cli.py` (arguments/output). `gimail.py` and `gimail/__main__.py` are entry points. Contributions should include focused stdlib `unittest` coverage, especially for changes to mutation safety.
+Code lives in `gimail/`: `accounts.py` (private config/credential selection), `keyring.py` (optional secret-tool lookup), `imap_client.py` (protocol/MIME), `imap_response.py` (structured FETCH metadata), and `cli.py` (arguments/output). `gimail.py` and `gimail/__main__.py` are entry points. Contributions should include focused stdlib `unittest` coverage, especially for changes to mutation safety.
 
 ## License
 

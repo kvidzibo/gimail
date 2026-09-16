@@ -13,10 +13,12 @@ from pathlib import Path
 from typing import Optional
 
 from .errors import GimailError
+from .keyring import lookup_password
 
 
 ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 SECURITIES = ("ssl", "starttls", "plain")
+CREDENTIAL_FIELDS = frozenset(("password_env", "password", "password_keyring"))
 
 
 def clean_string(value):
@@ -34,6 +36,7 @@ class Account:
     security: str = "ssl"
     password_env: Optional[str] = None
     password: Optional[str] = field(default=None, repr=False)
+    password_keyring: bool = False
 
     @classmethod
     def from_record(cls, record):
@@ -55,15 +58,19 @@ class Account:
             raise GimailError("password_env must be a valid environment variable name.")
         if password is not None and not clean_string(password):
             raise GimailError("Stored passwords must be nonempty strings without control characters.")
-        if (password_env is None) == (password is None):
-            raise GimailError("Set exactly one of password_env or password for each account.")
-        return cls(record["name"], record["host"], port, record["user"], security, password_env, password)
+        password_keyring = record.get("password_keyring", False)
+        if type(password_keyring) is not bool:
+            raise GimailError("password_keyring must be a boolean.")
+        if sum((password_env is not None, password is not None, password_keyring)) != 1:
+            raise GimailError("Set exactly one credential source: password_env, password, or password_keyring=true.")
+        return cls(record["name"], record["host"], port, record["user"], security, password_env, password, password_keyring)
 
     def public(self):
         result = {
             "name": self.name, "host": self.host, "port": self.port,
             "user": self.user, "security": self.security,
-            "credential_source": "environment" if self.password_env else "stored_password",
+            "credential_source": ("keyring" if self.password_keyring else
+                                  "environment" if self.password_env else "stored_password"),
         }
         if self.password_env:
             result["password_env"] = self.password_env
@@ -71,14 +78,19 @@ class Account:
 
     def record(self):
         result = {key: getattr(self, key) for key in ("name", "host", "port", "user", "security")}
-        if self.password_env:
+        if self.password_keyring:
+            result["password_keyring"] = True
+        elif self.password_env:
             result["password_env"] = self.password_env
         else:
             result["password"] = self.password
         return result
 
     def secret(self):
-        password = os.environ.get(self.password_env) if self.password_env else self.password
+        if self.password_keyring:
+            password = lookup_password(self.name)
+        else:
+            password = os.environ.get(self.password_env) if self.password_env else self.password
         if not clean_string(password):
             raise GimailError("Password is missing, empty, or contains unsupported control characters. Check the account's credential source.", "auth_failed")
         return password
@@ -187,20 +199,20 @@ def saved_account_index(accounts, name):
 
 
 def update_account(path, name, changes, make_default=False, confirm=False):
-    allowed = {"host", "port", "user", "security", "password_env", "password"}
+    allowed = {"host", "port", "user", "security"} | CREDENTIAL_FIELDS
     if not changes and not make_default:
         raise GimailError("No updates supplied. Provide an account field or --default.", exit_status=2)
-    if set(changes) - allowed or {"password", "password_env"} <= set(changes):
+    changed_sources = set(changes) & CREDENTIAL_FIELDS
+    if set(changes) - allowed or len(changed_sources) > 1:
         raise GimailError("Unsupported account fields or conflicting credential sources.", exit_status=2)
     with (config_lock(path) if confirm else nullcontext()):
         accounts, default = load_config(path)
         index = saved_account_index(accounts, name)
         before = accounts[index].record()
         record = {**before, **changes}
-        if "password_env" in changes:
-            record.pop("password", None)
-        elif "password" in changes:
-            record.pop("password_env", None)
+        if changed_sources:
+            for key in CREDENTIAL_FIELDS - changed_sources:
+                record.pop(key, None)
         updated = Account.from_record(record)
         after = updated.record()
         changed_fields = sorted(key for key in before.keys() | after.keys() if before.get(key) != after.get(key))
