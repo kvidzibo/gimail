@@ -57,6 +57,29 @@ class AccountMutationTests(unittest.TestCase):
         self.assertEqual(saved['password'], 'new-private-secret')
         self.assertNotIn('new-private-secret', json.dumps(result))
 
+    def test_switching_between_all_three_sources_preserves_other_settings(self):
+        sources = [{'password': 'new-private-secret'}, {'password_env': 'MAIL_PASSWORD'}, {'password_keyring': True}]
+        keys = {'password', 'password_env', 'password_keyring'}
+        fields = {key: value for key, value in self.personal.record().items() if key not in keys}
+        for old in sources:
+            for new in sources:
+                if old == new:
+                    continue
+                with self.subTest(old=list(old), new=list(new)):
+                    saved = Account.from_record({**fields, **old})
+                    save_config(self.path, [saved, self.work], 'personal')
+                    before = self.path.read_bytes()
+                    with patch.object(Account, 'secret', side_effect=AssertionError('metadata must not retrieve passwords')):
+                        preview = update_account(self.path, 'personal', new)
+                        self.assertTrue(preview['dry_run'])
+                        self.assertEqual(before, self.path.read_bytes())
+                        result = update_account(self.path, 'personal', new, confirm=True)
+                    accounts, default = load_config(self.path)
+                    self.assertEqual(accounts[0].record(), {**fields, **new})
+                    self.assertEqual(accounts[1], self.work)
+                    self.assertEqual(default, 'personal')
+                    self.assertNotIn('new-private-secret', json.dumps(result))
+
     def test_preview_does_not_echo_an_old_password_mistaken_for_an_env_name(self):
         account = Account('mistake', 'host', 993, 'user', password_env='thisWasReallyThePassword')
         save_config(self.path, [account], 'mistake')
@@ -84,7 +107,10 @@ class AccountMutationTests(unittest.TestCase):
         before = self.path.read_bytes()
         cases = [{}, {'name': 'renamed'}, {'port': 65536}, {'host': 'bad\r\nvalue'},
                  {'password_env': 'not-a-variable'}, {'password': ''},
-                 {'password': 'private-secret', 'password_env': 'PASSWORD'}]
+                 {'password': 'private-secret', 'password_env': 'PASSWORD'},
+                 {'password_keyring': True, 'password_env': 'PASSWORD'},
+                 {'password_keyring': True, 'password': 'private-secret'},
+                 {'password_keyring': 'true'}, {'password_keyring': False}]
         for changes in cases:
             with self.subTest(changes=changes), self.assertRaises(GimailError):
                 update_account(self.path, 'personal', changes, confirm=True)

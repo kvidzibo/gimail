@@ -92,6 +92,82 @@ class CliTests(unittest.TestCase):
         status, _ = self.invoke('account', 'test', 'gmail')
         self.assertEqual(status, 0)
 
+    def test_keyring_add_list_and_remove_never_resolve_credentials(self):
+        with patch('gimail.accounts.lookup_password', side_effect=AssertionError('metadata must not access keyring')) as lookup:
+            status, result = self.invoke('account', 'add', 'personal', '--preset', 'gmail', '--user', 'me', '--keyring')
+            self.assertEqual(status, 0)
+            self.assertEqual(result['data']['credential_source'], 'keyring')
+            saved = json.loads(self.path.read_text())['accounts'][0]
+            self.assertTrue(saved['password_keyring'])
+            self.assertNotIn('password', saved)
+            self.assertNotIn('password_env', saved)
+            status, result = self.invoke('account', 'list')
+            self.assertEqual(status, 0)
+            self.assertEqual(result['data']['accounts'][0]['credential_source'], 'keyring')
+            status, text = self.invoke('account', 'list', '--text', text=True)
+            self.assertEqual(status, 0)
+            self.assertIn('keyring', text)
+            status, _ = self.invoke('account', 'remove', 'personal', '--confirm')
+            self.assertEqual(status, 0)
+            lookup.assert_not_called()
+        self.assertEqual(self.fake.calls, [])
+
+    def test_keyring_update_is_previewed_and_switches_sources_without_lookup(self):
+        self.seed_saved_accounts()
+        before = self.path.read_bytes()
+        with patch('gimail.accounts.lookup_password', side_effect=AssertionError('config update must not access keyring')) as lookup:
+            status, result = self.invoke('account', 'update', 'personal', '--keyring')
+            self.assertEqual(status, 0)
+            self.assertEqual(result['data']['changed_fields'], ['password_env', 'password_keyring'])
+            self.assertEqual(before, self.path.read_bytes())
+            status, _ = self.invoke('account', 'update', 'personal', '--keyring', '--confirm')
+            self.assertEqual(status, 0)
+            saved = json.loads(self.path.read_text())['accounts'][0]
+            self.assertTrue(saved['password_keyring'])
+            self.assertNotIn('password_env', saved)
+            status, _ = self.invoke('account', 'update', 'personal', '--password-env', 'NEW_PASSWORD', '--confirm')
+            self.assertEqual(status, 0)
+            saved = json.loads(self.path.read_text())['accounts'][0]
+            self.assertNotIn('password_keyring', saved)
+            self.assertEqual(saved['password_env'], 'NEW_PASSWORD')
+            lookup.assert_not_called()
+        self.assertEqual(self.fake.calls, [])
+
+    def test_keyring_flags_are_mutually_exclusive_with_other_sources(self):
+        self.seed_saved_accounts()
+        before = self.path.read_bytes()
+        for command in (('account', 'add', 'new', '--preset', 'gmail', '--user', 'me'),
+                        ('account', 'update', 'personal')):
+            for other in (('--password-env', 'PASSWORD'), ('--password-stdin',)):
+                status, result = self.invoke(*command, '--keyring', *other, '--confirm')
+                self.assertEqual(status, 2)
+                self.assertFalse(result['ok'])
+                self.assertEqual(before, self.path.read_bytes())
+        self.assertEqual(self.fake.calls, [])
+
+    def test_normal_keyring_commands_login_without_exposing_password(self):
+        self.invoke('account', 'add', 'personal', '--preset', 'gmail', '--user', 'me', '--keyring')
+        with patch('gimail.accounts.lookup_password', return_value='never-print-this-secret') as lookup:
+            for args in (('account', 'test', 'personal'), ('list', '--account', 'personal', '--unread', '--limit', '5')):
+                status, result = self.invoke(*args)
+                self.assertEqual(status, 0)
+                self.assertEqual(result['data']['account'], 'personal')
+            self.assertEqual(lookup.call_count, 2)
+            lookup.assert_called_with('personal')
+        self.assertIn(('LOGIN', '"me"', 'never-print-this-secret'), self.fake.calls)
+
+    def test_keyring_failures_are_json_or_text_auth_errors_before_connecting(self):
+        self.invoke('account', 'add', 'personal', '--preset', 'gmail', '--user', 'me', '--keyring')
+        with patch('gimail.keyring.shutil.which', return_value=None):
+            status, result = self.invoke('account', 'test', 'personal')
+            self.assertEqual(status, 1)
+            self.assertEqual(result['code'], 'auth_failed')
+            status, text = self.invoke('account', 'test', 'personal', '--text', text=True)
+            self.assertEqual(status, 1)
+            self.assertIn('auth_failed', text)
+            self.assertIn('libsecret-tools', text)
+        self.assertEqual(self.fake.calls, [])
+
     def test_account_argument_errors_do_not_write_or_connect(self):
         cases = [
             ('account', 'test', 'one', '--account', 'two'),

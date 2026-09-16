@@ -84,6 +84,7 @@ def build_parser():
     credentials = add.add_mutually_exclusive_group(required=True)
     credentials.add_argument("--password-env", metavar="VARIABLE", help="preferred: store only an environment variable name")
     credentials.add_argument("--password-stdin", action="store_true", help="read and store a plaintext password from stdin")
+    credentials.add_argument("--keyring", action="store_true", help="retrieve the password from GNOME Keyring via secret-tool; does not create an entry")
     add.add_argument("--default", action="store_true", help="make this account the default")
 
     update = accounts.add_parser("update", help="preview changing a saved account; apply with --confirm")
@@ -96,6 +97,7 @@ def build_parser():
     updated_credentials = update.add_mutually_exclusive_group()
     updated_credentials.add_argument("--password-env", metavar="VARIABLE", help="replace credential source with an environment variable name, not its value")
     updated_credentials.add_argument("--password-stdin", action="store_true", help="read one plaintext password line from stdin; store only with --confirm")
+    updated_credentials.add_argument("--keyring", action="store_true", help="use GNOME Keyring via secret-tool; does not create, change, or delete keyring entries")
     update.add_argument("--default", action="store_true", help="make this account the default")
 
     remove = accounts.add_parser("remove", help="preview removing a saved profile; choose from a numbered list when NAME is omitted")
@@ -173,7 +175,9 @@ def dispatch(args):
                 "port": args.port if args.port is not None else (993 if args.security == "ssl" else 143),
                 "security": args.security,
             }
-            if args.password_stdin:
+            if args.keyring:
+                record["password_keyring"] = True
+            elif args.password_stdin:
                 record["password"] = sys.stdin.readline().rstrip("\r\n")
             else:
                 record["password_env"] = args.password_env
@@ -192,7 +196,9 @@ def dispatch(args):
         if args.account_command == "update":
             changes = {key: getattr(args, key) for key in ("host", "port", "user", "security", "password_env")
                        if getattr(args, key) is not None}
-            if args.password_stdin:
+            if args.keyring:
+                changes["password_keyring"] = True
+            elif args.password_stdin:
                 changes["password"] = sys.stdin.readline().rstrip("\r\n")
             return update_account(path, args.account, changes, make_default=args.default, confirm=args.confirm)
         if args.account_command == "remove":

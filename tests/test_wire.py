@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 
 from tests.helpers import BODY, HEADERS
+from tests.keyring_helper import make_secret_tool
 
 ROOT = Path(__file__).resolve().parents[1]
 SECRET = 'wire-test-password-not-a-real-credential'
@@ -143,6 +144,53 @@ class WireTests(unittest.TestCase):
         self.assertIn(b'EXAMINE "INBOX"\r\n', self.wire())
         self.assertIn(b'LOGIN "wire\\"user\\\\name"', self.wire())
         self.assertFalse(Path(self.env['GIMAIL_CONFIG']).exists())
+
+    def configure_keyring_fixture(self, body):
+        directory = Path(self.temp.name) / 'bin'
+        make_secret_tool(directory, body)
+        self.env.update(PATH=str(directory), HOME=self.temp.name,
+                        DBUS_SESSION_BUS_ADDRESS='unix:path=/nonexistent-gimail-test-bus')
+        self.env.pop('GNOME_KEYRING_CONTROL', None)
+        status, _ = self.invoke('account', 'add', 'personal', '--host', '127.0.0.1',
+                                '--port', str(self.server.server_address[1]), '--security', 'plain',
+                                '--user', 'keyring-user', '--keyring')
+        self.assertEqual(status, 0)
+        self.assertEqual(self.server.commands, [])
+
+    def test_normal_cli_retrieves_keyring_password_internally_and_sends_it_to_imap(self):
+        trace = Path(self.temp.name) / 'helper-args.json'
+        password = '  keyring-wire-fixture-not-an-env-password  '
+        body = f'''import json, sys
+from pathlib import Path
+Path({str(trace)!r}).write_text(json.dumps(sys.argv[1:]))
+sys.stderr.write({password!r})
+sys.stdout.write({password!r})
+'''
+        self.configure_keyring_fixture(body)
+        self.assertFalse(trace.exists(), 'account add must not query keyring')
+        status, result = self.invoke('--account', 'personal', 'list', '--unread', '--limit', '5')
+        self.assertEqual(status, 0)
+        self.assertEqual(result['data']['account'], 'personal')
+        self.assertEqual(json.loads(trace.read_text()), ['lookup', '--', 'service', 'gimail', 'account', 'personal'])
+        self.assertIn(('LOGIN "keyring-user" "' + password + '"\r\n').encode(), self.wire())
+        self.assertNotIn(SECRET.encode(), self.wire())
+        self.assertNotIn(password, json.dumps(result))
+        self.assertIn(b'EXAMINE "INBOX"\r\n', self.wire())
+
+    def test_failing_keyring_helper_cannot_leak_or_fall_back_to_environment_login(self):
+        body = f'import sys; sys.stdout.write({SECRET!r}); sys.stderr.write({SECRET!r}); sys.exit(1)'
+        self.configure_keyring_fixture(body)
+        status, result = self.invoke('account', 'test', 'personal')
+        self.assertEqual(status, 1)
+        self.assertEqual(result['code'], 'auth_failed')
+        self.assertEqual(self.server.commands, [])
+
+    def test_empty_keyring_password_errors_before_any_network_connection(self):
+        self.configure_keyring_fixture('pass')
+        status, result = self.invoke('list', '--account', 'personal')
+        self.assertEqual(status, 1)
+        self.assertEqual(result['code'], 'auth_failed')
+        self.assertEqual(self.server.commands, [])
 
     def test_show_does_not_change_seen_and_missing_uid_errors(self):
         status, result = self.invoke('show', '7')
