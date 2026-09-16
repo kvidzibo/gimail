@@ -1,0 +1,21 @@
+{
+  "default_account": "work",
+  "accounts": [
+    {
+      "name": "personal",
+      "host": "imap.gmail.com",
+      "port": 993,
+      "user": "you@gmail.com",
+      "security": "ssl",
+      "password_env": "GMAIL_APP_PASSWORD"
+    },
+    {
+      "name": "work",
+      "host": "imap.example.org",
+      "port": 143,
+      "user": "you@example.org",
+      "security": "starttls",
+      "password_env": "WORK_IMAP_PASSWORD"
+    }
+  ]
+}
