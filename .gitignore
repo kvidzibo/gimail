@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+accounts.json
+!examples/accounts.json
+app.log
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/

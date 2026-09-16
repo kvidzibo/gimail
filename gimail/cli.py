@@ -1,0 +1,248 @@
+"""JSON-first command line interface. stdout is one result, never debug logs."""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import unicodedata
+
+from . import __version__
+from .accounts import (
+    Account, SECURITIES, add_account, config_path, environment_account,
+    load_config, select_account,
+)
+from .errors import GimailError
+from .imap_client import MailClient, mailbox
+
+
+class Parser(argparse.ArgumentParser):
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("allow_abbrev", False)
+        super().__init__(*args, **kwargs)
+
+    def error(self, message):
+        # argparse diagnostics can echo secrets accidentally passed as arguments.
+        raise GimailError("Invalid arguments. Use --help on the command for usage.", exit_status=2)
+
+
+def positive(value):
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("expected a positive integer") from None
+    if number <= 0:
+        raise argparse.ArgumentTypeError("expected a positive integer")
+    return number
+
+
+def port_value(value):
+    number = positive(value)
+    if number > 65535:
+        raise argparse.ArgumentTypeError("expected a port between 1 and 65535")
+    return number
+
+
+def uid_value(value):
+    if not value.isascii() or not value.isdigit() or not 0 < int(value) <= 4294967295:
+        raise argparse.ArgumentTypeError("expected one UID between 1 and 4294967295")
+    return int(value)
+
+
+def common(parser):
+    # SUPPRESS prevents a subparser's defaults overwriting earlier global flags.
+    for names, options in (
+        (("--text",), dict(action="store_true", help="human-readable output instead of JSON")),
+        (("--config",), dict(metavar="PATH", help="accounts config path (also GIMAIL_CONFIG)")),
+        (("--account",), dict(metavar="NAME", help="use this saved account (also GIMAIL_ACCOUNT)")),
+        (("--folder",), dict(metavar="FOLDER", help="source mailbox (default: INBOX)")),
+        (("--confirm",), dict(action="store_true", help="apply mark/move/delete instead of previewing")),
+    ):
+        parser.add_argument(*names, default=argparse.SUPPRESS, **options)
+
+
+def build_parser():
+    parser = Parser(prog="gimail", description="Scriptable IMAP, JSON by default. No Gmail API.")
+    common(parser)
+    parser.add_argument("--version", action="version", version="gimail " + __version__)
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    account = commands.add_parser("account", help="manage or test accounts")
+    common(account)
+    accounts = account.add_subparsers(dest="account_command", required=True)
+    add = accounts.add_parser("add", help="add an account without overwriting existing names")
+    common(add)
+    add.add_argument("name")
+    add.add_argument("--preset", choices=("gmail",))
+    add.add_argument("--host")
+    add.add_argument("--port", type=port_value)
+    add.add_argument("--user", required=True)
+    add.add_argument("--security", choices=SECURITIES, default="ssl", help="default: ssl; plain sends credentials unencrypted")
+    credentials = add.add_mutually_exclusive_group(required=True)
+    credentials.add_argument("--password-env", metavar="VARIABLE", help="preferred: store only an environment variable name")
+    credentials.add_argument("--password-stdin", action="store_true", help="read and store a plaintext password from stdin")
+    add.add_argument("--default", action="store_true", help="make this account the default")
+    common(accounts.add_parser("list", help="list saved accounts and environment setup, without secrets"))
+    test = accounts.add_parser("test", help="test login and read-only access to the selected folder")
+    common(test)
+    test.add_argument("name", nargs="?", help="saved account name (or use --account)")
+
+    listing = commands.add_parser("list", help="list message headers, newest UID first")
+    common(listing)
+    listing.add_argument("--unread", action="store_true")
+    listing.add_argument("--limit", type=positive, default=20)
+
+    show = commands.add_parser("show", help="show a message without marking it read")
+    common(show)
+    show.add_argument("uid", type=uid_value)
+
+    search = commands.add_parser("search", help="search messages; filters are ANDed")
+    common(search)
+    search.add_argument("--from", dest="sender")
+    search.add_argument("--subject")
+    search.add_argument("--query", help="raw, single-line IMAP search criteria")
+    search.add_argument("--limit", type=positive, default=20)
+
+    mark = commands.add_parser("mark", help="preview changing Seen; apply with --confirm")
+    common(mark)
+    mark.add_argument("uid", type=uid_value)
+    flags = mark.add_mutually_exclusive_group(required=True)
+    flags.add_argument("--read", dest="read", action="store_true")
+    flags.add_argument("--unread", dest="read", action="store_false")
+
+    move = commands.add_parser("move", help="preview moving one UID; apply with --confirm")
+    common(move)
+    move.add_argument("uid", type=uid_value)
+    move.add_argument("destination", metavar="FOLDER")
+
+    delete = commands.add_parser("delete", help="preview setting Deleted (no expunge); apply with --confirm")
+    common(delete)
+    delete.add_argument("uid", type=uid_value)
+    return parser
+
+
+def dispatch(args):
+    path = config_path(args.config)
+    if args.command == "account":
+        if args.account_command == "add":
+            if not args.host and args.preset != "gmail":
+                raise GimailError("Provide --host for generic IMAP, or --preset gmail.", exit_status=2)
+            record = {
+                "name": args.name, "host": args.host or "imap.gmail.com", "user": args.user,
+                "port": args.port if args.port is not None else (993 if args.security == "ssl" else 143),
+                "security": args.security,
+            }
+            if args.password_stdin:
+                record["password"] = sys.stdin.readline().rstrip("\r\n")
+            else:
+                record["password_env"] = args.password_env
+            return add_account(path, Account.from_record(record), args.default)
+        if args.account_command == "list":
+            saved, default = load_config(path)
+            env = environment_account()
+            return {
+                "accounts": [account.public() for account in saved],
+                "default_account": default or (saved[0].name if saved else None),
+                "environment_account": env.public() if env else None,
+            }
+        if args.name and args.account and args.name != args.account:
+            raise GimailError("Use either the positional account name or a matching --account.", exit_status=2)
+        args.account = args.name or args.account
+
+    mailbox(args.folder)  # Validate before opening a connection.
+    if args.command == "move":
+        mailbox(args.destination)
+    account = select_account(path, args.account)
+    mutation = args.command in ("mark", "move", "delete")
+    with MailClient(account) as client:
+        client.select(args.folder, readonly=not (mutation and args.confirm))
+        if args.command == "account":
+            return {**client.context(), "connected": True, "security": account.security}
+        if args.command == "list":
+            return client.search(unread=args.unread, limit=args.limit)
+        if args.command == "search":
+            return client.search(sender=args.sender, subject=args.subject, query=args.query, limit=args.limit)
+        if args.command == "show":
+            return {**client.context(), **client.fetch(args.uid, include_body=True)}
+        return client.mutate(args.command, args.uid, confirm=args.confirm,
+                             read=getattr(args, "read", None), destination=getattr(args, "destination", None))
+
+
+def terminal_safe(value, multiline=False):
+    result = []
+    for char in str(value):
+        if char == "\n" and multiline:
+            result.append(char)
+        elif unicodedata.category(char).startswith("C"):
+            result.append(" " if char in "\r\n\t" else "\\u{:04x}".format(ord(char)))
+        else:
+            result.append(char)
+    return "".join(result)
+
+
+def render_text(data):
+    if "dry_run" in data:
+        prefix = "DRY RUN" if data["dry_run"] else "APPLIED"
+        details = f"{data['action']} UID {data['uid']} in {data['folder']}"
+        if "destination" in data:
+            details += " -> " + data["destination"]
+        if "read" in data:
+            details += " (read)" if data["read"] else " (unread)"
+        lines = [terminal_safe(prefix + ": " + details), terminal_safe(data["subject"])]
+        lines.extend(terminal_safe(data[key]) for key in ("note", "hint") if key in data)
+        return "\n".join(lines)
+    if "messages" in data:
+        lines = ["UID\tSTATE\tFROM\tSUBJECT\tDATE"]
+        for message in data["messages"]:
+            lines.append("\t".join(terminal_safe(value) for value in (
+                message["uid"], "unread" if message["unread"] else "read",
+                message["from"], message["subject"], message["date"],
+            )))
+        if not data["messages"]:
+            lines.append("(no messages)")
+        return "\n".join(lines)
+    if "text" in data:
+        lines = [terminal_safe(f"{key.title()}: {data[key]}") for key in ("uid", "from", "to", "subject", "date")]
+        body = data["text"] or data["html"]
+        lines.extend(("", terminal_safe(body, multiline=True)))
+        if data["attachments"]:
+            lines.append("\nAttachments:")
+            lines.extend(terminal_safe(f"- {part['filename'] or '(unnamed)'} ({part['content_type']}, {part['size']} bytes)") for part in data["attachments"])
+        return "\n".join(lines)
+    return terminal_safe(json.dumps(data, indent=2, ensure_ascii=True), multiline=True)
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    text = "--text" in argv
+    status = 0
+    try:
+        args = build_parser().parse_args(argv)
+        for key, default in (("text", False), ("config", None), ("account", None), ("folder", "INBOX"), ("confirm", False)):
+            if not hasattr(args, key):
+                setattr(args, key, default)
+        text = args.text
+        result = {"ok": True, "data": dispatch(args)}
+    except GimailError as exc:
+        result = {"ok": False, "error": str(exc), "code": exc.code}
+        status = exc.exit_status
+    except KeyboardInterrupt:
+        result = {"ok": False, "error": "Interrupted. If confirming a change, inspect server state before retrying.", "code": "imap_error"}
+        status = 130
+    except Exception:
+        # Do not expose tracebacks, server responses, config content, or credentials.
+        result = {"ok": False, "error": "Unexpected failure; details suppressed to protect credentials. If confirming a change, inspect server state before retrying.", "code": "imap_error"}
+        status = 1
+    if text:
+        output = render_text(result["data"]) if result["ok"] else f"Error ({result['code']}): {result['error']}"
+    else:
+        output = json.dumps(result, ensure_ascii=True)
+    try:
+        print(output, flush=True)
+    except BrokenPipeError:
+        # Avoid a second BrokenPipeError when the interpreter flushes stdout.
+        try:
+            sys.stdout.close()
+        except BrokenPipeError:
+            pass
+        return 0
+    return status
