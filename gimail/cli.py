@@ -9,7 +9,7 @@ import unicodedata
 from . import __version__
 from .accounts import (
     Account, SECURITIES, add_account, config_path, environment_account,
-    load_config, select_account,
+    load_config, remove_account, select_account, update_account,
 )
 from .errors import GimailError
 from .imap_client import MailClient, mailbox
@@ -48,15 +48,19 @@ def uid_value(value):
     return int(value)
 
 
-def common(parser):
+def common(parser, account_config=False):
     # SUPPRESS prevents a subparser's defaults overwriting earlier global flags.
+    account_help = ("explicit saved account; must match NAME if supplied" if account_config
+                    else "use this saved account (also GIMAIL_ACCOUNT)")
     for names, options in (
         (("--text",), dict(action="store_true", help="human-readable output instead of JSON")),
         (("--config",), dict(metavar="PATH", help="accounts config path (also GIMAIL_CONFIG)")),
-        (("--account",), dict(metavar="NAME", help="use this saved account (also GIMAIL_ACCOUNT)")),
+        (("--account",), dict(metavar="NAME", help=account_help)),
         (("--folder",), dict(metavar="FOLDER", help="source mailbox (default: INBOX)")),
-        (("--confirm",), dict(action="store_true", help="apply mark/move/delete instead of previewing")),
+        (("--confirm",), dict(action="store_true", help="apply mail mutations or account update/remove instead of previewing")),
     ):
+        if account_config and names == ("--folder",):
+            continue
         parser.add_argument(*names, default=argparse.SUPPRESS, **options)
 
 
@@ -81,6 +85,23 @@ def build_parser():
     credentials.add_argument("--password-env", metavar="VARIABLE", help="preferred: store only an environment variable name")
     credentials.add_argument("--password-stdin", action="store_true", help="read and store a plaintext password from stdin")
     add.add_argument("--default", action="store_true", help="make this account the default")
+
+    update = accounts.add_parser("update", help="preview changing a saved account; apply with --confirm")
+    common(update, account_config=True)
+    update.add_argument("name")
+    update.add_argument("--host")
+    update.add_argument("--port", type=port_value)
+    update.add_argument("--user")
+    update.add_argument("--security", choices=SECURITIES, help="change security only; use --port to change the port too")
+    updated_credentials = update.add_mutually_exclusive_group()
+    updated_credentials.add_argument("--password-env", metavar="VARIABLE", help="replace credential source with an environment variable name, not its value")
+    updated_credentials.add_argument("--password-stdin", action="store_true", help="read one plaintext password line from stdin; store only with --confirm")
+    update.add_argument("--default", action="store_true", help="make this account the default")
+
+    remove = accounts.add_parser("remove", help="preview removing a saved profile; choose from a numbered list when NAME is omitted")
+    common(remove, account_config=True)
+    remove.add_argument("name", nargs="?", help="saved account name, or omit for the interactive picker")
+
     common(accounts.add_parser("list", help="list saved accounts and environment setup, without secrets"))
     test = accounts.add_parser("test", help="test login and read-only access to the selected folder")
     common(test)
@@ -120,6 +141,27 @@ def build_parser():
     return parser
 
 
+def choose_account_to_remove(path):
+    accounts, default = load_config(path)
+    if not accounts:
+        raise GimailError("No saved accounts to remove.", "not_found")
+    if not (sys.stdin.isatty() and sys.stderr.isatty()):
+        raise GimailError("An account name is required without an interactive terminal. Use account remove NAME, or --account NAME.", exit_status=2)
+    default = default or accounts[0].name
+    print("Saved accounts (profiles only; mail is not removed):", file=sys.stderr)
+    for index, account in enumerate(accounts, 1):
+        label = account.name + (" (default)" if account.name == default else "")
+        print(f"  {index}) {terminal_safe(label)}", file=sys.stderr)
+    print("Choose index (Enter, 0, or q cancels): ", end="", file=sys.stderr, flush=True)
+    choice = sys.stdin.readline().strip()
+    if choice.lower() in ("", "0", "q"):
+        return None
+    if not choice.isascii() or not choice.isdigit() or len(choice) > 10 or not 1 <= int(choice) <= len(accounts):
+        raise GimailError("Invalid account index. Nothing was removed; run account remove again.", exit_status=2)
+    # Return the displayed object, not just an index into a later config load.
+    return accounts[int(choice) - 1]
+
+
 def dispatch(args):
     path = config_path(args.config)
     if args.command == "account":
@@ -144,9 +186,23 @@ def dispatch(args):
                 "default_account": default or (saved[0].name if saved else None),
                 "environment_account": env.public() if env else None,
             }
-        if args.name and args.account and args.name != args.account:
+        if args.name is not None and args.account is not None and args.name != args.account:
             raise GimailError("Use either the positional account name or a matching --account.", exit_status=2)
-        args.account = args.name or args.account
+        args.account = args.name if args.name is not None else args.account
+        if args.account_command == "update":
+            changes = {key: getattr(args, key) for key in ("host", "port", "user", "security", "password_env")
+                       if getattr(args, key) is not None}
+            if args.password_stdin:
+                changes["password"] = sys.stdin.readline().rstrip("\r\n")
+            return update_account(path, args.account, changes, make_default=args.default, confirm=args.confirm)
+        if args.account_command == "remove":
+            selected = None
+            if args.account is None:
+                selected = choose_account_to_remove(path)
+                if selected is None:
+                    return {"action": "account_remove", "cancelled": True, "dry_run": True}
+                args.account = selected.name
+            return remove_account(path, args.account, confirm=args.confirm, expected_account=selected)
 
     mailbox(args.folder)  # Validate before opening a connection.
     if args.command == "move":
@@ -180,6 +236,21 @@ def terminal_safe(value, multiline=False):
 
 
 def render_text(data):
+    if data.get("action") in ("account_update", "account_remove"):
+        if data.get("cancelled"):
+            return "Cancelled. No config changes."
+        prefix = "DRY RUN" if data["dry_run"] else "APPLIED"
+        if not data["dry_run"] and data.get("changed_fields") == []:
+            prefix = "NO CHANGES"
+        action = data["action"].split("_", 1)[1]
+        lines = [terminal_safe(f"{prefix}: {action} account {data['account']}")]
+        if "changed_fields" in data:
+            lines.append("Changed fields: " + (", ".join(data["changed_fields"]) or "none"))
+        lines.append(terminal_safe("Default account: " + (data["default_account"] or "(none)")))
+        if "remaining_accounts" in data:
+            lines.append(f"Remaining saved accounts: {data['remaining_accounts']}")
+        lines.extend(terminal_safe(data[key]) for key in ("note", "hint") if key in data)
+        return "\n".join(lines)
     if "dry_run" in data:
         prefix = "DRY RUN" if data["dry_run"] else "APPLIED"
         details = f"{data['action']} UID {data['uid']} in {data['folder']}"
