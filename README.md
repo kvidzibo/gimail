@@ -1,6 +1,6 @@
 # gimail
 
-A small, scriptable IMAP client for humans and AI agents. **Python standard library only; no pip dependencies, Gmail API, or cloud service.** Gmail is a preset, not a requirement.
+A small, scriptable IMAP client for humans and AI agents. **Python standard library only; no Python runtime dependencies, Gmail API, or cloud service.** Gmail is a preset, not a requirement.
 
 - JSON by default; `--text` for humans.
 - SSL with certificate verification by default; STARTTLS and explicit plaintext IMAP supported.
@@ -11,24 +11,46 @@ A small, scriptable IMAP client for humans and AI agents. **Python standard libr
 
 ## Install
 
-Python **3.9+** on Debian/Linux or another POSIX system. No installation or virtual environment is needed to run:
+Python **3.9+** on Debian/Linux or another POSIX system.
+
+### Recommended: uv tool install
+
+With [uv](https://docs.astral.sh/uv/getting-started/installation/) installed:
+
+```sh
+uv tool install git+https://github.com/kvidzibo/gimail
+gimail --help
+```
+
+uv creates an isolated environment and installs the `gimail` command. It works from any directory; no checkout or manual symlink is needed. The Git URL explicitly selects this repository rather than a same-named package from a package index.
+
+Keep uv's tool-bin directory on `PATH` (`uv tool dir --bin` shows it; usually `~/.local/bin`). If an old manual `gimail` symlink conflicts, remove only that symlink before installing rather than force-overwriting an unrelated executable.
+
+```sh
+uv tool upgrade gimail
+uv tool uninstall gimail
+```
+
+Uninstalling the tool leaves your account config and keyring entries intact. To pin an installation, append `@<commit-or-tag>` to the Git URL; upgrades respect that reference.
+
+For a one-off run without a persistent tool installation:
+
+```sh
+uvx --from git+https://github.com/kvidzibo/gimail gimail --help
+```
+
+### Run directly from a clone
+
+uv is optional. No installation or virtual environment is needed for the original entry points:
 
 ```sh
 git clone https://github.com/kvidzibo/gimail.git
 cd gimail
 python3 gimail.py --help
+python3 -m gimail --help
 ```
 
-`python3 -m gimail` also works from the clone. Optionally make `gimail` available on your PATH (keep the clone in place):
-
-```sh
-mkdir -p "$HOME/.local/bin"
-ln -s "$PWD/gimail.py" "$HOME/.local/bin/gimail"
-export PATH="$HOME/.local/bin:$PATH"
-gimail --help
-```
-
-The examples below use that optional `gimail` command. Without the symlink, substitute `python3 gimail.py`.
+The examples below use the installed `gimail` command. From an uninstalled clone, substitute `python3 gimail.py`.
 
 ## First run: environment variables only
 
@@ -39,7 +61,7 @@ export GIMAIL_HOST=imap.example.org
 export GIMAIL_USER=you@example.org
 read -rsp 'IMAP password: ' GIMAIL_PASSWORD; printf '\n'
 export GIMAIL_PASSWORD
-python3 gimail.py list --unread --limit 5
+gimail list --unread --limit 5
 ```
 
 Reading the password this way keeps it out of shell history and command-line arguments. A secret manager can supply the same environment variable. `gimail` does not load `.env` files automatically.
@@ -70,8 +92,8 @@ export GIMAIL_PRESET=gmail
 export GIMAIL_USER=you@gmail.com
 read -rsp 'Gmail App Password: ' GIMAIL_PASSWORD; printf '\n'
 export GIMAIL_PASSWORD
-python3 gimail.py account test
-python3 gimail.py list --unread --limit 5
+gimail account test
+gimail list --unread --limit 5
 ```
 
 Personal Gmail accounts [already have IMAP enabled](https://support.google.com/mail/answer/7126229). Workspace administrators may restrict access. App Passwords may be unavailable for managed accounts, Advanced Protection, or security-key-only 2-Step Verification; see [Google's requirements](https://support.google.com/accounts/answer/185833). `gimail` does not implement OAuth or bypass those restrictions. Changing your Google password revokes existing App Passwords.
@@ -306,11 +328,27 @@ Prefer `password_env` or `password_keyring: true` over plaintext storage. A miss
 
 ## Development
 
-Python package dependencies: none. The optional `--keyring` backend needs the system `secret-tool` executable and an accessible Secret Service keyring. For an isolated, pip-free development environment:
+Python **runtime** dependencies: none. Packaging uses `uv_build` as a build-only backend (bundled with compatible uv versions), not as an application dependency. The optional `--keyring` backend still needs the system `secret-tool` executable and an accessible Secret Service keyring.
+
+From the clone, the preferred development workflow is:
+
+```sh
+uv sync --locked
+uv run --locked gimail --help
+xvfb-run -a uv run --locked python -W error -m unittest discover -v
+uv build
+xvfb-run -a uv run --locked python -W error -m tests.package_smoke
+```
+
+The packaging check builds wheels and an sdist, installs each with `uv tool install` into temporary directories, and exercises the installed command outside the checkout. It verifies metadata/version consistency, no Python runtime dependencies, credential/log-file exclusions, and IMAP/keyring behavior using only fixtures. Add `--git-ref HEAD` after committing to also test installation through a local Git URL; CI checks all three install sources. It does not replace your installed tools or touch real mail/keyrings. Keep real configs and secrets outside the package directory.
+
+`pyproject.toml` defines the `gimail = gimail.cli:main` entry point and flat package layout. `uv.lock` records the project with no runtime dependencies. Keep the project version in `pyproject.toml` aligned with `gimail/__init__.py`.
+
+For core tests without uv or installation:
 
 ```sh
 python3 -m venv --without-pip .venv
-.venv/bin/python -m unittest discover -v
+xvfb-run -a .venv/bin/python -W error -m unittest discover -v
 ```
 
 The tests use fake IMAP connections, a loopback test server with real `imaplib`/CLI subprocesses, and pseudo-terminals for the numbered picker. Picker tests exercise stdout/stderr separation, cancellation, and changes to the config while the user is choosing. CI runs terminal UI tests under `xvfb-run`; no display is required by the CLI itself. Keyring tests use disposable fake `secret-tool` executables and an inaccessible test D-Bus address, never the real desktop keyring. They verify internal credential retrieval through real CLI/IMAP subprocesses, timeout cleanup, and output secrecy. Tests need no mail account, keyring, secrets, or internet and do not touch your real config. CI runs the same suite on Python 3.9, 3.11, and 3.14. Live Gmail/generic-server access is not part of the offline suite; use `account test` with your own credentials.
