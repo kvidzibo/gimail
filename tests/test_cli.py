@@ -126,6 +126,151 @@ class CliTests(unittest.TestCase):
         status, _ = self.invoke('account', 'list')
         self.assertEqual(status, 0)
 
+    def seed_saved_accounts(self):
+        for name in ('personal', 'work'):
+            status, _ = self.invoke('account', 'add', name, '--host', 'imap.example.org',
+                                    '--user', name, '--password-env', 'UNSET_PASSWORD')
+            self.assertEqual(status, 0)
+
+    def test_account_update_preview_and_confirm(self):
+        self.seed_saved_accounts()
+        before = self.path.read_bytes()
+        status, result = self.invoke('account', 'update', 'personal', '--password-env', 'GMAIL_APP_PASSWORD')
+        self.assertEqual(status, 0)
+        self.assertEqual(result['data']['changed_fields'], ['password_env'])
+        self.assertTrue(result['data']['dry_run'])
+        self.assertEqual(before, self.path.read_bytes())
+        status, result = self.invoke('--confirm', 'account', 'update', 'personal', '--password-env', 'GMAIL_APP_PASSWORD')
+        self.assertEqual(status, 0)
+        self.assertFalse(result['data']['dry_run'])
+        self.assertEqual(json.loads(self.path.read_text())['accounts'][0]['password_env'], 'GMAIL_APP_PASSWORD')
+        self.assertEqual(self.fake.calls, [])
+
+    def test_account_update_all_connection_fields_and_default(self):
+        self.seed_saved_accounts()
+        status, result = self.invoke('account', 'update', 'work', '--host', 'other.example.org',
+                                     '--port', '143', '--security', 'starttls', '--user', 'other', '--default', '--confirm')
+        self.assertEqual(status, 0)
+        saved = json.loads(self.path.read_text())
+        self.assertEqual(saved['default_account'], 'work')
+        self.assertEqual(saved['accounts'][1], dict(name='work', host='other.example.org', port=143,
+                                                   user='other', security='starttls', password_env='UNSET_PASSWORD'))
+        self.assertEqual(self.fake.calls, [])
+
+    def test_account_update_stdin_is_secret_safe_in_preview_and_apply(self):
+        self.seed_saved_accounts()
+        before = self.path.read_bytes()
+        for confirm in (False, True):
+            with patch('sys.stdin', io.StringIO('never-print-this-secret\n')):
+                status, result = self.invoke('account', 'update', 'personal', '--password-stdin',
+                                             *(['--confirm'] if confirm else []))
+            self.assertEqual(status, 0)
+            if not confirm:
+                self.assertEqual(before, self.path.read_bytes())
+        saved = json.loads(self.path.read_text())['accounts'][0]
+        self.assertEqual(saved['password'], 'never-print-this-secret')
+        self.assertNotIn('password_env', saved)
+        self.assertEqual(self.fake.calls, [])
+
+    def test_new_account_command_argument_errors_are_json(self):
+        self.seed_saved_accounts()
+        before = self.path.read_bytes()
+        cases = [
+            ('account', 'update', 'personal'),
+            ('account', 'update', 'personal', '--password-env', 'PASSWORD', '--password-stdin'),
+            ('account', 'update', 'personal', '--password', 'never-print-this-secret'),
+            ('account', 'update', 'personal', '--port', '65536'),
+            ('account', 'update', 'personal', '--host', 'host', '--account', 'work'),
+            ('account', 'remove', 'personal', '--account', 'work'),
+            ('account', 'remove', 'personal', '--confir'),
+        ]
+        for args in cases:
+            with self.subTest(args=args):
+                status, result = self.invoke(*args)
+                self.assertEqual(status, 2)
+                self.assertFalse(result['ok'])
+                self.assertEqual(before, self.path.read_bytes())
+        self.assertEqual(self.fake.calls, [])
+
+    def test_account_remove_name_preview_confirm_and_readd(self):
+        self.seed_saved_accounts()
+        before = self.path.read_bytes()
+        status, result = self.invoke('account', 'remove', 'personal')
+        self.assertEqual(status, 0)
+        self.assertTrue(result['data']['dry_run'])
+        self.assertEqual(result['data']['default_account'], 'work')
+        self.assertEqual(before, self.path.read_bytes())
+        status, result = self.invoke('account', 'remove', 'personal', '--confirm')
+        self.assertEqual(status, 0)
+        self.assertFalse(result['data']['dry_run'])
+        self.assertEqual(json.loads(self.path.read_text())['default_account'], 'work')
+        status, _ = self.invoke('account', 'add', 'personal', '--preset', 'gmail', '--user', 'me@gmail.com', '--password-env', 'PASSWORD')
+        self.assertEqual(status, 0)
+        self.assertEqual(self.fake.calls, [])
+
+    def test_noninteractive_remove_requires_explicit_name_and_ignores_env_default(self):
+        self.seed_saved_accounts()
+        os.environ['GIMAIL_ACCOUNT'] = 'personal'
+        before = self.path.read_bytes()
+        for confirm in (False, True):
+            with patch('sys.stdin', io.StringIO('1\n')):
+                status, result = self.invoke('account', 'remove', *(['--confirm'] if confirm else []))
+            self.assertEqual(status, 2)
+            self.assertIn('interactive terminal', result['error'])
+            self.assertEqual(before, self.path.read_bytes())
+        # An explicit --account is a supported alternative to the positional name.
+        status, result = self.invoke('--account', 'work', 'account', 'remove', '--confirm')
+        self.assertEqual(status, 0)
+        self.assertEqual(result['data']['account'], 'work')
+        self.assertEqual(self.fake.calls, [])
+
+    def test_account_remove_empty_and_missing_return_not_found(self):
+        status, result = self.invoke('account', 'remove')
+        self.assertEqual(status, 1)
+        self.assertEqual(result['code'], 'not_found')
+        self.seed_saved_accounts()
+        for args in (('account', 'remove', 'missing'), ('account', 'update', 'missing', '--user', 'new')):
+            status, result = self.invoke(*args)
+            self.assertEqual(status, 1)
+            self.assertEqual(result['code'], 'not_found')
+        self.assertEqual(self.fake.calls, [])
+
+    def test_account_mutation_text_and_config_override(self):
+        other = self.path.with_name('other.json')
+        status, _ = self.invoke('account', 'add', 'personal', '--host', 'host', '--user', 'me',
+                                '--password-env', 'PASSWORD', '--config', str(other))
+        self.assertEqual(status, 0)
+        status, result = self.invoke('--config', str(other), 'account', 'update', 'personal', '--user', 'new', '--text', text=True)
+        self.assertEqual(status, 0)
+        self.assertIn('DRY RUN: update account personal', result)
+        self.assertIn('Changed fields: user', result)
+        status, result = self.invoke('account', 'update', 'personal', '--user', 'new', '--confirm', '--text', '--config', str(other), text=True)
+        self.assertEqual(status, 0)
+        self.assertIn('APPLIED: update account personal', result)
+        status, result = self.invoke('account', 'update', 'personal', '--user', 'new', '--confirm', '--text', '--config', str(other), text=True)
+        self.assertEqual(status, 0)
+        self.assertIn('NO CHANGES', result)
+        status, result = self.invoke('account', 'remove', 'personal', '--text', '--config', str(other), text=True)
+        self.assertEqual(status, 0)
+        self.assertIn('DRY RUN: remove account personal', result)
+        self.assertIn('Default account: (none)', result)
+        self.assertFalse(self.path.exists())
+        self.assertEqual(self.fake.calls, [])
+
+    def test_interactive_picker_names_are_terminal_safe(self):
+        class TTY(io.StringIO):
+            def isatty(self):
+                return True
+        self.invoke('account', 'add', 'name\u202e', '--host', 'host', '--user', 'user', '--password-env', 'PASSWORD')
+        output, terminal = io.StringIO(), TTY()
+        with patch('sys.stdin', TTY('q\n')), contextlib.redirect_stdout(output), contextlib.redirect_stderr(terminal):
+            status = main(['account', 'remove'])
+        self.assertEqual(status, 0)
+        self.assertTrue(json.loads(output.getvalue())['data']['cancelled'])
+        self.assertNotIn('\u202e', terminal.getvalue())
+        self.assertIn(r'\u202e', terminal.getvalue())
+        self.assertEqual(self.fake.calls, [])
+
     def test_auth_error_json_and_text(self):
         self.fake.failure = 'LOGIN'
         status, result = self.invoke('account', 'test')

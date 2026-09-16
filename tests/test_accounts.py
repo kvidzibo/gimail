@@ -35,7 +35,10 @@ class AccountsTests(unittest.TestCase):
         accounts, default = load_config(self.path)
         self.assertEqual(default, 'work')
         self.assertEqual(accounts[0].secret(), 'super-secret')
-        self.assertEqual(list(self.path.parent.iterdir()), [self.path])
+        lock = self.path.with_name('accounts.json.lock')
+        self.assertEqual(set(self.path.parent.iterdir()), {self.path, lock})
+        self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o600)
+        self.assertEqual(lock.read_bytes(), b'')
 
     def test_duplicate_does_not_overwrite(self):
         add_account(self.path, self.account)

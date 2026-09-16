@@ -1,11 +1,13 @@
 """Account configuration. Never include credentials in diagnostic messages."""
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
 import stat
 import tempfile
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -141,15 +143,102 @@ def save_config(path, accounts, default):
             os.unlink(temporary)
 
 
+@contextmanager
+def config_lock(path):
+    """Protect read-modify-write operations; never hold this lock while prompting."""
+    fd = None
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        lock_path = path.with_name(path.name + ".lock")
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o077
+                or info.st_uid != os.getuid()):
+            raise GimailError("Accounts lock must be a regular private file owned by you, with mode 600.")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise GimailError("Accounts config is busy. Retry after the other writer finishes.") from None
+        yield
+    except OSError:
+        raise GimailError("Could not securely lock accounts config.") from None
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
 def add_account(path, account, make_default=False):
-    accounts, default = load_config(path)
-    if any(existing.name == account.name for existing in accounts):
-        raise GimailError("Account already exists; refusing to overwrite it.")
-    accounts.append(account)
-    if make_default or default is None:
-        default = account.name
-    save_config(path, accounts, default)
+    with config_lock(path):
+        accounts, default = load_config(path)
+        if any(existing.name == account.name for existing in accounts):
+            raise GimailError("Account already exists; refusing to overwrite it.")
+        accounts.append(account)
+        if make_default or default is None:
+            default = account.name
+        save_config(path, accounts, default)
     return account.public()
+
+
+def saved_account_index(accounts, name):
+    for index, account in enumerate(accounts):
+        if account.name == name:
+            return index
+    raise GimailError("Named account not found in config.", "not_found")
+
+
+def update_account(path, name, changes, make_default=False, confirm=False):
+    allowed = {"host", "port", "user", "security", "password_env", "password"}
+    if not changes and not make_default:
+        raise GimailError("No updates supplied. Provide an account field or --default.", exit_status=2)
+    if set(changes) - allowed or {"password", "password_env"} <= set(changes):
+        raise GimailError("Unsupported account fields or conflicting credential sources.", exit_status=2)
+    with (config_lock(path) if confirm else nullcontext()):
+        accounts, default = load_config(path)
+        index = saved_account_index(accounts, name)
+        before = accounts[index].record()
+        record = {**before, **changes}
+        if "password_env" in changes:
+            record.pop("password", None)
+        elif "password" in changes:
+            record.pop("password_env", None)
+        updated = Account.from_record(record)
+        after = updated.record()
+        changed_fields = sorted(key for key in before.keys() | after.keys() if before.get(key) != after.get(key))
+        next_default = name if make_default else default
+        if next_default != default:
+            changed_fields.append("default_account")
+        result = {
+            "action": "account_update", "account": name, "dry_run": not confirm,
+            "changed_fields": changed_fields,
+            "default_account": next_default or accounts[0].name,
+        }
+        if confirm and changed_fields:
+            accounts[index] = updated
+            save_config(path, accounts, next_default)
+        elif not confirm:
+            result["hint"] = "Re-run account update with the same fields and --confirm to apply."
+        return result
+
+
+def remove_account(path, name, confirm=False, expected_account=None):
+    with (config_lock(path) if confirm else nullcontext()):
+        accounts, default = load_config(path)
+        index = saved_account_index(accounts, name)
+        if expected_account is not None and accounts[index] != expected_account:
+            raise GimailError("Selected account changed while choosing. Nothing was removed; run account remove again.")
+        remaining = accounts[:index] + accounts[index + 1:]
+        next_default = (remaining[0].name if remaining else None) if default == name else default
+        result = {
+            "action": "account_remove", "account": name, "dry_run": not confirm,
+            "default_account": next_default or (remaining[0].name if remaining else None),
+            "remaining_accounts": len(remaining),
+            "note": "Removes only the saved profile; mail, environment variables, and keyring entries are unchanged.",
+        }
+        if confirm:
+            save_config(path, remaining, next_default)
+        else:
+            result["hint"] = "Re-run account remove with this account name and --confirm to apply."
+        return result
 
 
 def environment_account():

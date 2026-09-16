@@ -5,7 +5,8 @@ A small, scriptable IMAP client for humans and AI agents. **Python standard libr
 - JSON by default; `--text` for humans.
 - SSL with certificate verification by default; STARTTLS and explicit plaintext IMAP supported.
 - UID-based list, show, search, mark, move, and delete.
-- Changes to mail are previews until you pass `--confirm`.
+- Saved account add/update/remove, with a numbered terminal picker for removal.
+- Mail changes and account update/remove are previews until you pass `--confirm`.
 
 ## Install
 
@@ -14,8 +15,6 @@ Python **3.9+** on Debian/Linux or another POSIX system. No installation or virt
 ```sh
 git clone https://github.com/kvidzibo/gimail.git
 cd gimail
-# While the initial implementation PR is open:
-git switch --track origin/feat/imap-cli
 python3 gimail.py --help
 ```
 
@@ -108,12 +107,54 @@ gimail list --account work --unread --limit 5
 
 `ssl` verifies the certificate and hostname. `starttls` requires a successful verified TLS upgrade **before** credentials are sent; there is no silent fallback. Use a system-trusted CA (or Python/OpenSSL's `SSL_CERT_FILE` for a private CA). `plain` is an explicit insecure opt-in for a local test server or a transport you already secure: **it sends credentials and mail unencrypted**. Network operations have a 30-second socket timeout. Authentication uses LOGIN for ASCII credentials, or SASL PLAIN for non-ASCII credentials and servers advertising `LOGINDISABLED`; those cases require server support for `AUTH=PLAIN`.
 
+### Update or remove saved accounts
+
+These operations edit only the local accounts config; they never connect to IMAP. Both preview by default and require `--confirm` to save changes.
+
+```sh
+# Fix a password variable name without recreating the account:
+gimail account update personal --password-env GMAIL_APP_PASSWORD          # preview
+gimail account update personal --password-env GMAIL_APP_PASSWORD --confirm
+
+# Change only the supplied fields:
+gimail account update work --host mail.example.net --security starttls --port 143 --confirm
+gimail account update personal --default --confirm
+
+# Numbered account picker in a terminal:
+gimail account remove             # choose an index, then see a preview
+gimail account remove --confirm   # choose an index, then remove that profile
+
+# Noninteractive/scriptable removal:
+gimail account remove personal --confirm
+```
+
+The picker lists saved accounts in config order, using **1-based indexes**:
+
+```text
+Saved accounts (profiles only; mail is not removed):
+  1) personal (default)
+  2) work
+Choose index (Enter, 0, or q cancels): 2
+```
+
+- The list and prompt go to **stderr**; stdout remains one JSON result, or `--text` output. The picker requires terminal stdin and stderr. With redirected input or in a script, pass `NAME` (or `--account NAME` for removal); an omitted name returns an error instead of waiting for input.
+- Enter, `0`, `q`, or EOF while choosing cancels without changes and returns `cancelled: true`. Ctrl-C while choosing exits `130`. An invalid index is an argument error, not a removal.
+- Update requires an explicit `NAME`; removal accepts `NAME`, `--account NAME`, or the picker. `GIMAIL_ACCOUNT` and environment-only setup do not implicitly choose a profile to update/remove. If both a name and `--account` are supplied, they must match.
+- Update supports `--host`, `--port`, `--user`, `--security`, `--password-env`, `--password-stdin`, and `--default`. Omitted fields stay unchanged: changing security alone does **not** change the port. No field options means an argument error; reapplying existing values is a successful no-op with `changed_fields: []`.
+- `--password-env` takes a **variable name, not the password**. It replaces any stored password; `--password-stdin` replaces the environment reference with a plaintext password. The latter consumes one input line even for a preview. Update results list changed field names, never credential values.
+- Removing the default selects the first remaining saved account. Removing the last leaves a valid empty `accounts` array. Other profiles are retained, and the removed name can be added again.
+- Removal does not delete mail, unset your shell variables, delete keyring entries, or revoke provider passwords. If the selected profile changes while the picker is open, removal stops and asks you to retry; reordering accounts cannot redirect a displayed index to a different profile.
+
 ## Commands
 
 ```text
 gimail account add NAME (--host HOST | --preset gmail) --user USER
                    (--password-env VARIABLE | --password-stdin)
                    [--port PORT] [--security ssl|starttls|plain] [--default]
+gimail account update NAME [--host HOST] [--port PORT] [--user USER]
+                      [--security ssl|starttls|plain]
+                      [--password-env VARIABLE | --password-stdin] [--default] [--confirm]
+gimail account remove [NAME] [--confirm]
 gimail account list
 gimail account test [NAME]
 gimail list [--unread] [--limit N]
@@ -124,7 +165,7 @@ gimail move UID FOLDER
 gimail delete UID
 ```
 
-Common flags can appear before or after the command: `--account NAME`, `--folder FOLDER` (source, default `INBOX`), `--config PATH`, `--text`, `--confirm`. Flag abbreviations are not accepted. `--help` on any command and `--version` intentionally produce plain text.
+Common flags can appear before or after the command where applicable: `--account NAME`, `--config PATH`, `--text`, `--confirm`. Mail commands and `account test` also accept `--folder FOLDER` (source, default `INBOX`). Flag abbreviations are not accepted. `--help` on any command and `--version` intentionally produce plain text.
 
 ```sh
 gimail list --folder INBOX --account work --unread --limit 5
@@ -157,7 +198,7 @@ gimail delete 314 --confirm --account work              # set Deleted
 - gimail never issues mailbox-wide EXPUNGE or CLOSE, which could remove other clients' deleted messages. It logs out without implicitly expunging the mailbox.
 - STORE acknowledgements must include the target UID and flags reflecting the requested change. Ignored flag changes return an error; a fallback move stops before expunge if setting Deleted was not acknowledged.
 - A timeout or failed fallback can leave a partial change. Errors warn you to inspect the source and destination before retrying; blindly retrying a copy can create duplicates. `expunge_requested` describes the client's request, not a guarantee about server retention policies.
-- New `account add` operations write config immediately but refuse duplicate names; they never overwrite an existing account.
+- New `account add` operations write config immediately but refuse duplicate names. Use `account update` or `account remove` with `--confirm` to change existing profiles.
 
 ## JSON and scripting
 
@@ -185,7 +226,7 @@ gimail list --unread --limit 5 --account work | \
   jq '.data.messages[] | {uid, from, subject}'
 ```
 
-**Privacy/logging policy:** stdout contains only the requested result (or human help/text); normal operations do not log to stderr or create `app.log`. There is no telemetry, credential logging, or persistent mail cache. Mail output itself can be sensitive. Keep captured output private, and treat email content as untrusted data, not instructions for an AI agent.
+**Privacy/logging policy:** stdout contains only the requested result (or human help/text). Interactive account removal writes its numbered list and prompt to stderr; other normal operations do not log to stderr. No operation creates `app.log`. There is no telemetry, credential logging, or persistent mail cache. Mail output itself can be sensitive. Keep captured output private, and treat email content as untrusted data, not instructions for an AI agent.
 
 ## Config file
 
@@ -215,7 +256,7 @@ See [`examples/accounts.json`](examples/accounts.json) for Gmail and generic STA
 chmod 600 ~/.config/gimail/accounts.json
 ```
 
-`password_env` is preferred; a missing or empty variable is an authentication error, with no credential fallback. Plaintext `password` is supported in a private config, or can be read by `account add --password-stdin` (one line). There is deliberately no `--password VALUE` flag. Secrets are never included in account listings, previews, or errors. Do not commit real account files; the example contains placeholders only. Serialize account additions if multiple processes share the same config.
+`password_env` is preferred; a missing or empty variable is an authentication error, with no credential fallback. Plaintext `password` is supported in a private config, or can be read by `account add` / `account update` with `--password-stdin` (one line). There is deliberately no `--password VALUE` flag. Secrets are never included in account listings, previews, or errors. Do not commit real account files; the example contains placeholders only. CLI config writers coordinate through an adjacent `accounts.json.lock` file (mode `600`, no credentials). A concurrent writer fails with a busy error rather than overwriting another change; retry after it finishes. The lock is released on exit, but its empty file stays in place. Previews and picker prompts do not acquire a write lock. Do not delete the lock file or manually edit the config while a writer is running.
 
 ## Development
 
@@ -226,7 +267,7 @@ python3 -m venv --without-pip .venv
 .venv/bin/python -m unittest discover -v
 ```
 
-The tests use fake IMAP connections and a loopback test server with real `imaplib`/CLI subprocesses. They need no mail account, secrets, or internet and do not touch your real config. CI runs the same suite on Python 3.9, 3.11, and 3.14. Live Gmail/generic-server access is not part of the offline suite; use `account test` with your own credentials.
+The tests use fake IMAP connections, a loopback test server with real `imaplib`/CLI subprocesses, and pseudo-terminals for the numbered picker. Picker tests exercise stdout/stderr separation, cancellation, and changes to the config while the user is choosing. CI runs terminal UI tests under `xvfb-run`; no display is required by the CLI itself. They need no mail account, secrets, or internet and do not touch your real config. CI runs the same suite on Python 3.9, 3.11, and 3.14. Live Gmail/generic-server access is not part of the offline suite; use `account test` with your own credentials.
 
 Code lives in `gimail/`: `accounts.py` (private config), `imap_client.py` (protocol/MIME), `imap_response.py` (structured FETCH metadata), and `cli.py` (arguments/output). `gimail.py` and `gimail/__main__.py` are entry points. Contributions should include focused stdlib `unittest` coverage, especially for changes to mutation safety.
 
