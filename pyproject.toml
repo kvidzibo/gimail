@@ -1,0 +1,33 @@
+[project]
+name = "gimail"
+version = "0.1.0"
+description = "A scriptable, JSON-first IMAP CLI for humans and AI agents"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = []
+classifiers = [
+    "Environment :: Console",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+]
+
+[project.scripts]
+gimail = "gimail.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/kvidzibo/gimail"
+Repository = "https://github.com/kvidzibo/gimail"
+Issues = "https://github.com/kvidzibo/gimail/issues"
+
+[build-system]
+requires = ["uv_build>=0.11.8,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "gimail"
+module-root = ""
+source-include = ["gimail.py", "tests/*.py", "examples/accounts.json", "uv.lock"]
+source-exclude = [".env", ".env.*", "*.log", "/gimail/**/*.json", "/gimail/**/*.lock"]
