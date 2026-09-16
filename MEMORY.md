@@ -7,3 +7,4 @@
 - Parse FETCH attributes structurally: keywords such as `UID`, numeric flags, and nested extension strings can fool a whole-response regex. Covered by `test_fetch_keywords_cannot_spoof_uid_or_size_attributes` and wire tests.
 - A tagged OK plus the correct UID does not prove STORE applied a flag. Verify the returned flags before reporting success or expunging a copied source. Covered by `test_store_ignored_flags_cannot_report_success_or_expunge`.
 - ASCII credentials may still need SASL PLAIN when the server advertises LOGINDISABLED. Respect pre-authentication capabilities; covered by unit and real-imaplib wire tests.
+- Distinguish an absent CLI target (`None`) from an explicitly empty one (`""`): truthy fallback can redirect an empty shell variable to another account. Covered by `test_empty_explicit_names_never_fall_through_to_another_account`, including no writes or connections.

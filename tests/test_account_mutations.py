@@ -1,6 +1,8 @@
 import json
-import os
+import select
 import stat
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -157,6 +159,37 @@ class AccountMutationTests(unittest.TestCase):
                 self.assertEqual(self.path.read_bytes(), before)
             self.assertTrue(update_account(self.path, 'work', {'user': 'changed'})['dry_run'])
             self.assertTrue(remove_account(self.path, 'work')['dry_run'])
+        remove_account(self.path, 'work', confirm=True)
+
+    def test_writer_lock_is_exclusive_across_processes(self):
+        code = '''
+import sys
+from pathlib import Path
+from gimail.accounts import config_lock
+with config_lock(Path(sys.argv[1])):
+    print('locked', flush=True)
+    sys.stdin.read(1)
+'''
+        before = self.path.read_bytes()
+        with subprocess.Popen([sys.executable, '-c', code, str(self.path)],
+                              cwd=Path(__file__).resolve().parents[1], stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as writer:
+            try:
+                self.assertTrue(select.select([writer.stdout], [], [], 8)[0], 'Writer did not become ready')
+                self.assertEqual(writer.stdout.readline(), 'locked\n')
+                for action in (lambda: update_account(self.path, 'work', {'user': 'new'}, confirm=True),
+                               lambda: remove_account(self.path, 'work', confirm=True),
+                               lambda: add_account(self.path, Account('new', 'host', 993, 'me', password_env='PASSWORD'))):
+                    with self.assertRaisesRegex(GimailError, 'busy'):
+                        action()
+                self.assertEqual(before, self.path.read_bytes())
+            finally:
+                try:
+                    writer.communicate(input='x', timeout=8)
+                except subprocess.TimeoutExpired:
+                    writer.kill()
+                    writer.communicate()
+            self.assertEqual(writer.returncode, 0)
         remove_account(self.path, 'work', confirm=True)
 
     def test_private_regular_lock_is_required(self):

@@ -186,9 +186,9 @@ def dispatch(args):
                 "default_account": default or (saved[0].name if saved else None),
                 "environment_account": env.public() if env else None,
             }
-        if args.name and args.account and args.name != args.account:
+        if args.name is not None and args.account is not None and args.name != args.account:
             raise GimailError("Use either the positional account name or a matching --account.", exit_status=2)
-        args.account = args.name or args.account
+        args.account = args.name if args.name is not None else args.account
         if args.account_command == "update":
             changes = {key: getattr(args, key) for key in ("host", "port", "user", "security", "password_env")
                        if getattr(args, key) is not None}

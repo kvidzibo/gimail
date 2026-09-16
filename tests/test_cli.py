@@ -161,14 +161,14 @@ class CliTests(unittest.TestCase):
         self.seed_saved_accounts()
         before = self.path.read_bytes()
         for confirm in (False, True):
-            with patch('sys.stdin', io.StringIO('never-print-this-secret\n')):
+            with patch('sys.stdin', io.StringIO('  never-print-this-secret  \n')):
                 status, result = self.invoke('account', 'update', 'personal', '--password-stdin',
                                              *(['--confirm'] if confirm else []))
             self.assertEqual(status, 0)
             if not confirm:
                 self.assertEqual(before, self.path.read_bytes())
         saved = json.loads(self.path.read_text())['accounts'][0]
-        self.assertEqual(saved['password'], 'never-print-this-secret')
+        self.assertEqual(saved['password'], '  never-print-this-secret  ')
         self.assertNotIn('password_env', saved)
         self.assertEqual(self.fake.calls, [])
 
@@ -191,6 +191,27 @@ class CliTests(unittest.TestCase):
                 self.assertFalse(result['ok'])
                 self.assertEqual(before, self.path.read_bytes())
         self.assertEqual(self.fake.calls, [])
+
+    def test_empty_explicit_names_never_fall_through_to_another_account(self):
+        self.seed_saved_accounts()
+        before = self.path.read_bytes()
+        cases = [
+            (('account', 'update', '', '--account', 'personal', '--user', 'changed', '--confirm'), 2),
+            (('account', 'remove', '', '--account', 'personal', '--confirm'), 2),
+            (('account', 'test', '', '--account', 'personal'), 2),
+            (('account', 'remove', '', '--confirm'), 1),
+            (('account', 'update', '', '--user', 'changed', '--confirm'), 1),
+            (('account', 'test', ''), 1),
+        ]
+        for args, expected_status in cases:
+            with self.subTest(args=args):
+                self.path.write_bytes(before)
+                self.fake.calls.clear()
+                status, result = self.invoke(*args)
+                self.assertEqual(status, expected_status)
+                self.assertFalse(result['ok'])
+                self.assertEqual(before, self.path.read_bytes())
+                self.assertEqual(self.fake.calls, [])
 
     def test_account_remove_name_preview_confirm_and_readd(self):
         self.seed_saved_accounts()
