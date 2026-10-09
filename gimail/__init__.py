@@ -1,3 +1,3 @@
-"""gimail: a dependency-free IMAP CLI for humans and agents."""
+"""gimail: a dependency-free IMAP/SMTP CLI for humans and agents."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

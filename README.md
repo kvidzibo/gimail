@@ -1,10 +1,11 @@
 # gimail
 
-A small, scriptable IMAP client for humans and AI agents. **Python standard library only; no Python runtime dependencies, Gmail API, or cloud service.** Gmail is a preset, not a requirement.
+A small, scriptable IMAP/SMTP client for humans and AI agents. **Python standard library only; no Python runtime dependencies, Gmail API, or cloud service.** Gmail is a preset, not a requirement.
 
 - JSON by default; `--text` for humans.
 - SSL with certificate verification by default; STARTTLS and explicit plaintext IMAP supported.
 - UID-based list, show, search, mark, move, and delete.
+- Plain-text SMTP sending with verified TLS; local preview until `--confirm`.
 - Saved account add/update/remove, with a numbered terminal picker for removal.
 - Optional GNOME Keyring / Seahorse credentials, retrieved internally without agent-side shell wrappers.
 - Mail changes and account update/remove are previews until you pass `--confirm`.
@@ -69,12 +70,15 @@ Reading the password this way keeps it out of shell history and command-line arg
 | Variable | Meaning |
 | --- | --- |
 | `GIMAIL_HOST` | IMAP hostname; activates environment-only account `env` |
-| `GIMAIL_PRESET` | `gmail` supplies `imap.gmail.com`; also activates `env` |
+| `GIMAIL_PRESET` | `gmail` supplies `imap.gmail.com` and `smtp.gmail.com`; also activates `env` |
 | `GIMAIL_USER` | Login username, usually a full email address |
 | `GIMAIL_PASSWORD` | Password for the environment-only account |
 | `GIMAIL_PASSWORD_ENV` | Optional alternative variable **name** containing that password |
 | `GIMAIL_SECURITY` | `ssl` (default), `starttls`, or `plain` |
 | `GIMAIL_PORT` | Default `993` for SSL; `143` otherwise |
+| `GIMAIL_SMTP_HOST` | Optional SMTP hostname; requires environment account setup above |
+| `GIMAIL_SMTP_SECURITY` | `ssl` (default) or `starttls`; no plaintext SMTP |
+| `GIMAIL_SMTP_PORT` | Default `465` for SMTP SSL; `587` for STARTTLS |
 | `GIMAIL_ACCOUNT` | Select a saved account instead of environment-only setup |
 | `GIMAIL_CONFIG` | Override the accounts file path |
 
@@ -98,7 +102,7 @@ gimail list --unread --limit 5
 
 Personal Gmail accounts [already have IMAP enabled](https://support.google.com/mail/answer/7126229). Workspace administrators may restrict access. App Passwords may be unavailable for managed accounts, Advanced Protection, or security-key-only 2-Step Verification; see [Google's requirements](https://support.google.com/accounts/answer/185833). `gimail` does not implement OAuth or bypass those restrictions. Changing your Google password revokes existing App Passwords.
 
-The preset only supplies the hostname and normal SSL defaults. No Google-specific network API is used.
+The preset supplies IMAP/SMTP hostnames and normal SSL defaults when creating an account or using environment setup. Existing saved profiles are not modified; enable SMTP with `account update` as shown below. No Google-specific network API is used.
 
 ### Saved Gmail and generic accounts
 
@@ -208,10 +212,43 @@ Choose index (Enter, 0, or q cancels): 2
 - The list and prompt go to **stderr**; stdout remains one JSON result, or `--text` output. The picker requires terminal stdin and stderr. With redirected input or in a script, pass `NAME` (or `--account NAME` for removal); an omitted name returns an error instead of waiting for input.
 - Enter, `0`, `q`, or EOF while choosing cancels without changes and returns `cancelled: true`. Ctrl-C while choosing exits `130`. An invalid index is an argument error, not a removal.
 - Update requires an explicit `NAME`; removal accepts `NAME`, `--account NAME`, or the picker. `GIMAIL_ACCOUNT` and environment-only setup do not implicitly choose a profile to update/remove. If both a name and `--account` are supplied, they must match. An explicitly empty name is an error, never a fallback to another account.
-- Update supports `--host`, `--port`, `--user`, `--security`, `--password-env`, `--password-stdin`, `--keyring`, and `--default`. Omitted fields stay unchanged: changing security alone does **not** change the port. No field options means an argument error; reapplying existing values is a successful no-op with `changed_fields: []`.
+- Update supports `--host`, `--port`, `--user`, `--security`, `--smtp-host`, `--smtp-port`, `--smtp-security`, `--password-env`, `--password-stdin`, `--keyring`, and `--default`. Omitted fields stay unchanged: changing security alone does **not** change the port. No field options means an argument error; reapplying existing values is a successful no-op with `changed_fields: []`.
 - `--password-env` takes a **variable name, not the password**. Credential options are mutually exclusive: `--password-env`, `--password-stdin`, or `--keyring` replaces the previous source. `--password-stdin` stores plaintext in the config, not in the keyring. `--password-stdin` consumes one input line even for a preview. Update results list changed field names, never credential values.
 - Removing the default selects the first remaining saved account. Removing the last leaves a valid empty `accounts` array. Other profiles are retained, and the removed name can be added again.
 - Removal does not delete mail, unset your shell variables, delete keyring entries, or revoke provider passwords. If the selected profile changes while the picker is open, removal stops and asks you to retry; reordering accounts cannot redirect a displayed index to a different profile.
+
+## Sending email
+
+SMTP settings are separate from IMAP. Both use the account's **same login username and credential source**, including keyring; different SMTP credentials are not supported. A newly created Gmail preset account includes SMTP SSL on port 465. For an existing profile:
+
+```sh
+# Preview, then save the SMTP endpoint:
+gimail account update personal --smtp-host smtp.gmail.com
+gimail account update personal --smtp-host smtp.gmail.com --confirm
+
+# Generic provider using STARTTLS:
+gimail account update work --smtp-host smtp.example.org \
+  --smtp-security starttls --smtp-port 587 --confirm
+```
+
+Environment-only generic accounts need `GIMAIL_SMTP_HOST` alongside `GIMAIL_HOST`, `GIMAIL_USER`, and the password source. SMTP defaults to verified SSL/465; choose `GIMAIL_SMTP_SECURITY=starttls` for verified STARTTLS/587. SMTP does not support plaintext or downgrade fallback. Settings do not affect IMAP ports/security. On first SMTP setup the port defaults according to SMTP security; later updates preserve omitted fields, so change the port explicitly when switching security.
+
+```sh
+# body.txt must contain plain UTF-8 text:
+gimail send --account personal --to recipient@example.org \
+  --subject 'Hello' --body-file body.txt --text                # preview
+gimail send --account personal --to recipient@example.org \
+  --subject 'Hello' --body-file body.txt --confirm              # submit
+
+printf 'Hello from stdin.\n' | gimail send --account work \
+  --to one@example.org --to two@example.org --subject 'Hello' --body-stdin
+```
+
+- **Preview never connects, sends, or retrieves credentials.** Review its SMTP endpoint, sender, recipients, subject, and body before repeating the same input with `--confirm`. It does not test connectivity, authentication, or provider sender permissions. Changed files/settings between invocations change the message; a preview is not a reservation. Preview output contains the body: keep it private.
+- The sender defaults to the account username; use `--from you@example.org` if the login is not an email address or to select a provider-authorized alias. Recipients use repeated `--to`; exact duplicates are removed. Addresses must be bare ASCII dot-atom addresses with DNS-style domains, not display names, quoted local parts, comma-separated lists, or SMTPUTF8 addresses. Unicode subject/body are supported. Subjects must be nonempty and contain no control characters.
+- Body input is required: `--body-file PATH` or `--body-stdin` (reads all stdin). No attachments, CC/BCC, HTML, reply/thread support, or custom message headers. `send` does not use an IMAP folder.
+- Confirmed success reports `delivery: accepted`, the accepted recipients, and the generated Message-ID; SMTP acceptance **does not prove inbox delivery**. Gimail does not append a Sent-folder copy; providers may save one themselves. No automatic retry is performed.
+- Partial acceptance exits `1` with `code: partial_delivery` and `data.accepted`/`data.refused`. Do not resend to accepted recipients. A refused submission reports `delivery: not_sent`. A disconnect/timeout during submission reports `code: delivery_unknown` and `delivery: unknown`; inspect server state before retrying to avoid duplicates. Raw SMTP responses are never printed.
 
 ## Commands
 
@@ -219,9 +256,11 @@ Choose index (Enter, 0, or q cancels): 2
 gimail account add NAME (--host HOST | --preset gmail) --user USER
                    (--password-env VARIABLE | --password-stdin | --keyring)
                    [--port PORT] [--security ssl|starttls|plain] [--default]
+                   [--smtp-host HOST] [--smtp-port PORT] [--smtp-security ssl|starttls]
 gimail account update NAME [--host HOST] [--port PORT] [--user USER]
                       [--security ssl|starttls|plain]
                       [--password-env VARIABLE | --password-stdin | --keyring] [--default] [--confirm]
+                      [--smtp-host HOST] [--smtp-port PORT] [--smtp-security ssl|starttls]
 gimail account remove [NAME] [--confirm]
 gimail account list
 gimail account test [NAME]
@@ -231,9 +270,11 @@ gimail search [--from ADDRESS] [--subject WORDS] [--query IMAP] [--limit N]
 gimail mark UID (--read | --unread)
 gimail move UID FOLDER
 gimail delete UID
+gimail send --to ADDRESS [--to ADDRESS ...] --subject SUBJECT
+            (--body-file PATH | --body-stdin) [--from ADDRESS] [--confirm]
 ```
 
-Common flags can appear before or after the command where applicable: `--account NAME`, `--config PATH`, `--text`, `--confirm`. Mail commands and `account test` also accept `--folder FOLDER` (source, default `INBOX`). Flag abbreviations are not accepted. `--help` on any command and `--version` intentionally produce plain text.
+Common flags can appear before or after the command where applicable: `--account NAME`, `--config PATH`, `--text`, `--confirm`. IMAP commands and `account test` also accept `--folder FOLDER` (source, default `INBOX`). Flag abbreviations are not accepted. `--help` on any command and `--version` intentionally produce plain text.
 
 ```sh
 gimail list --folder INBOX --account work --unread --limit 5
@@ -284,7 +325,7 @@ Failures have this envelope:
 {"ok": false, "error": "Message UID not found in this folder.", "code": "not_found"}
 ```
 
-Codes: `auth_failed` (credentials/authentication), `not_found` (account, folder, or UID absent/inaccessible), `imap_error` (configuration, arguments, network, protocol, or other failure). Operational/config errors exit `1`; parsing/usage errors exit `2`; an interrupt exits `130`. Raw server errors and tracebacks are suppressed because they can echo credentials. `--text` escapes terminal control characters in mail.
+Codes: `auth_failed` (credentials/authentication), `not_found` (account, folder, or UID absent/inaccessible), `imap_error` (configuration, arguments, IMAP, or other failure), `smtp_error` (SMTP/message validation or submission failure), `partial_delivery` (some recipients accepted), `delivery_unknown` (submission status uncertain). SMTP delivery errors can also include safe `data` context as described above. Operational/config errors exit `1`; parsing/usage errors exit `2`; an interrupt exits `130`. Raw server errors and tracebacks are suppressed because they can echo credentials. `--text` escapes terminal control characters in mail.
 
 An empty search is a successful empty array, not `not_found`. Messages disappearing between search and fetch are skipped, so fewer than the limit may be returned. Example using optional `jq` (not a gimail dependency):
 
@@ -316,7 +357,7 @@ Default: `~/.config/gimail/accounts.json`, or `$XDG_CONFIG_HOME/gimail/accounts.
 }
 ```
 
-See [`examples/accounts.json`](examples/accounts.json) for Gmail and generic STARTTLS examples. Saved accounts need `name`, `host`, `user`, and exactly one credential source: `password_env`, `password`, or `password_keyring: true`. `password_keyring` must be a JSON boolean; `false` does not define a credential source. Optional `security` defaults to `ssl`; `port` defaults to 993 for SSL and 143 otherwise. `default_account` is optional.
+See [`examples/accounts.json`](examples/accounts.json) for Gmail and generic STARTTLS examples. Saved accounts need `name`, `host`, `user`, and exactly one credential source: `password_env`, `password`, or `password_keyring: true`. `password_keyring` must be a JSON boolean; `false` does not define a credential source. Optional `security` defaults to `ssl`; `port` defaults to 993 for SSL and 143 otherwise. `default_account` is optional. SMTP is opt-in for existing records: optional `smtp_host` enables it, `smtp_security` defaults to `ssl` (or explicit `starttls`), and `smtp_port` defaults to 465/587 respectively. SMTP port/security require a host; saved records without SMTP remain valid and cannot send until configured.
 
 `account add` creates the directory with mode `700` and atomically writes the file with mode **`600`**. Existing directory permissions are left unchanged; keep that directory private. Existing files must be owned by you, regular (not symlinks), and inaccessible to group/other users. A manually created file needs:
 
@@ -351,9 +392,9 @@ python3 -m venv --without-pip .venv
 xvfb-run -a .venv/bin/python -W error -m unittest discover -v
 ```
 
-The tests use fake IMAP connections, a loopback test server with real `imaplib`/CLI subprocesses, and pseudo-terminals for the numbered picker. Picker tests exercise stdout/stderr separation, cancellation, and changes to the config while the user is choosing. CI runs terminal UI tests under `xvfb-run`; no display is required by the CLI itself. Keyring tests use disposable fake `secret-tool` executables and an inaccessible test D-Bus address, never the real desktop keyring. They verify internal credential retrieval through real CLI/IMAP subprocesses, timeout cleanup, and output secrecy. Tests need no mail account, keyring, secrets, or internet and do not touch your real config. CI runs the same suite on Python 3.9, 3.11, and 3.14. Live Gmail/generic-server access is not part of the offline suite; use `account test` with your own credentials.
+The tests use fake IMAP/SMTP connections, a loopback IMAP test server with real `imaplib`/CLI subprocesses, and pseudo-terminals for the numbered picker. Picker tests exercise stdout/stderr separation, cancellation, and changes to the config while the user is choosing. CI runs terminal UI tests under `xvfb-run`; no display is required by the CLI itself. Keyring tests use disposable fake `secret-tool` executables and an inaccessible test D-Bus address, never the real desktop keyring. They verify internal credential retrieval through real CLI/IMAP subprocesses, timeout cleanup, and output secrecy. Tests need no mail account, keyring, secrets, or internet and do not touch your real config. CI runs the same suite on Python 3.9, 3.11, and 3.14. Live Gmail/generic-server access is not part of the offline suite; use `account test` with your own credentials.
 
-Code lives in `gimail/`: `accounts.py` (private config/credential selection), `keyring.py` (optional secret-tool lookup), `imap_client.py` (protocol/MIME), `imap_response.py` (structured FETCH metadata), and `cli.py` (arguments/output). `gimail.py` and `gimail/__main__.py` are entry points. Contributions should include focused stdlib `unittest` coverage, especially for changes to mutation safety.
+Code lives in `gimail/`: `accounts.py` (private config/credential selection), `keyring.py` (optional secret-tool lookup), `imap_client.py` (IMAP/MIME), `smtp_client.py` (safe message composition and SMTP submission), `imap_response.py` (structured FETCH metadata), and `cli.py` (arguments/output). `gimail.py` and `gimail/__main__.py` are entry points. Contributions should include focused stdlib `unittest` coverage, especially for changes to mutation safety.
 
 ## License
 

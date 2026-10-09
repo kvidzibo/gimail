@@ -5,14 +5,16 @@ import argparse
 import json
 import sys
 import unicodedata
+from pathlib import Path
 
 from . import __version__
 from .accounts import (
-    Account, SECURITIES, add_account, config_path, environment_account,
+    Account, SECURITIES, SMTP_FIELDS, SMTP_SECURITIES, add_account, config_path, environment_account,
     load_config, remove_account, select_account, update_account,
 )
 from .errors import GimailError
 from .imap_client import MailClient, mailbox
+from .smtp_client import send
 
 
 class Parser(argparse.ArgumentParser):
@@ -57,15 +59,21 @@ def common(parser, account_config=False):
         (("--config",), dict(metavar="PATH", help="accounts config path (also GIMAIL_CONFIG)")),
         (("--account",), dict(metavar="NAME", help=account_help)),
         (("--folder",), dict(metavar="FOLDER", help="source mailbox (default: INBOX)")),
-        (("--confirm",), dict(action="store_true", help="apply mail mutations or account update/remove instead of previewing")),
+        (("--confirm",), dict(action="store_true", help="send mail or apply mail mutations/account update/remove instead of previewing")),
     ):
         if account_config and names == ("--folder",):
             continue
         parser.add_argument(*names, default=argparse.SUPPRESS, **options)
 
 
+def smtp_options(parser):
+    parser.add_argument("--smtp-host", help="SMTP hostname; shares IMAP login and credential source")
+    parser.add_argument("--smtp-port", type=port_value, help="default on setup: 465 for ssl, 587 for starttls")
+    parser.add_argument("--smtp-security", choices=SMTP_SECURITIES, help="default on setup: ssl; update preserves existing port")
+
+
 def build_parser():
-    parser = Parser(prog="gimail", description="Scriptable IMAP, JSON by default. No Gmail API.")
+    parser = Parser(prog="gimail", description="Scriptable IMAP and SMTP, JSON by default. No Gmail API.")
     common(parser)
     parser.add_argument("--version", action="version", version="gimail " + __version__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -86,6 +94,7 @@ def build_parser():
     credentials.add_argument("--password-stdin", action="store_true", help="read and store a plaintext password from stdin")
     credentials.add_argument("--keyring", action="store_true", help="retrieve the password from GNOME Keyring via secret-tool; does not create an entry")
     add.add_argument("--default", action="store_true", help="make this account the default")
+    smtp_options(add)
 
     update = accounts.add_parser("update", help="preview changing a saved account; apply with --confirm")
     common(update, account_config=True)
@@ -99,6 +108,7 @@ def build_parser():
     updated_credentials.add_argument("--password-stdin", action="store_true", help="read one plaintext password line from stdin; store only with --confirm")
     updated_credentials.add_argument("--keyring", action="store_true", help="use GNOME Keyring via secret-tool; does not create, change, or delete keyring entries")
     update.add_argument("--default", action="store_true", help="make this account the default")
+    smtp_options(update)
 
     remove = accounts.add_parser("remove", help="preview removing a saved profile; choose from a numbered list when NAME is omitted")
     common(remove, account_config=True)
@@ -140,6 +150,15 @@ def build_parser():
     delete = commands.add_parser("delete", help="preview setting Deleted (no expunge); apply with --confirm")
     common(delete)
     delete.add_argument("uid", type=uid_value)
+
+    sending = commands.add_parser("send", help="preview sending plain-text mail; submit with --confirm")
+    common(sending, account_config=True)
+    sending.add_argument("--from", dest="sender", help="bare ASCII sender address (default: account user)")
+    sending.add_argument("--to", action="append", required=True, help="one bare ASCII recipient; repeat for multiple recipients")
+    sending.add_argument("--subject", required=True)
+    body = sending.add_mutually_exclusive_group(required=True)
+    body.add_argument("--body-file", metavar="PATH", help="read plain-text UTF-8 body from a file")
+    body.add_argument("--body-stdin", action="store_true", help="read plain-text UTF-8 body from stdin (all input)")
     return parser
 
 
@@ -174,6 +193,8 @@ def dispatch(args):
                 "name": args.name, "host": args.host or "imap.gmail.com", "user": args.user,
                 "port": args.port if args.port is not None else (993 if args.security == "ssl" else 143),
                 "security": args.security,
+                "smtp_host": args.smtp_host if args.smtp_host is not None else ("smtp.gmail.com" if args.preset == "gmail" else None),
+                "smtp_port": args.smtp_port, "smtp_security": args.smtp_security,
             }
             if args.keyring:
                 record["password_keyring"] = True
@@ -194,7 +215,7 @@ def dispatch(args):
             raise GimailError("Use either the positional account name or a matching --account.", exit_status=2)
         args.account = args.name if args.name is not None else args.account
         if args.account_command == "update":
-            changes = {key: getattr(args, key) for key in ("host", "port", "user", "security", "password_env")
+            changes = {key: getattr(args, key) for key in ("host", "port", "user", "security", "password_env", *SMTP_FIELDS)
                        if getattr(args, key) is not None}
             if args.keyring:
                 changes["password_keyring"] = True
@@ -209,6 +230,18 @@ def dispatch(args):
                     return {"action": "account_remove", "cancelled": True, "dry_run": True}
                 args.account = selected.name
             return remove_account(path, args.account, confirm=args.confirm, expected_account=selected)
+
+    if args.command == "send":
+        account = select_account(path, args.account)
+        try:
+            if args.body_stdin:
+                # Decode explicitly rather than depending on the caller's locale.
+                body = sys.stdin.buffer.read().decode("utf-8") if hasattr(sys.stdin, "buffer") else sys.stdin.read()
+            else:
+                body = Path(args.body_file).read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            raise GimailError("Cannot read body: expected an accessible UTF-8 file or stdin.", "smtp_error", 2) from None
+        return send(account, args.sender, args.to, args.subject, body, confirm=args.confirm)
 
     mailbox(args.folder)  # Validate before opening a connection.
     if args.command == "move":
@@ -242,6 +275,17 @@ def terminal_safe(value, multiline=False):
 
 
 def render_text(data):
+    if data.get("action") == "send":
+        prefix = "DRY RUN" if data["dry_run"] else data["delivery"].upper()
+        lines = [f"{prefix}: send via {data['account']}",
+                 f"SMTP: {data['smtp_host']}:{data['smtp_port']} ({data['smtp_security']})", f"From: {data['from']}",
+                 "To: " + ", ".join(data["to"]), "Subject: " + data["subject"]]
+        if "accepted" in data:
+            lines.extend(("Accepted: " + ", ".join(data["accepted"]), "Refused: " + ", ".join(data["refused"])))
+        lines.extend(data[key] for key in ("note", "hint") if key in data)
+        if "body" in data:
+            lines.extend(("", data["body"]))
+        return terminal_safe("\n".join(lines), multiline=True)
     if data.get("action") in ("account_update", "account_remove"):
         if data.get("cancelled"):
             return "Cancelled. No config changes."
@@ -292,6 +336,7 @@ def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     text = "--text" in argv
     status = 0
+    args = None
     try:
         args = build_parser().parse_args(argv)
         for key, default in (("text", False), ("config", None), ("account", None), ("folder", "INBOX"), ("confirm", False)):
@@ -301,16 +346,22 @@ def main(argv=None):
         result = {"ok": True, "data": dispatch(args)}
     except GimailError as exc:
         result = {"ok": False, "error": str(exc), "code": exc.code}
+        if exc.data is not None:
+            result["data"] = exc.data
         status = exc.exit_status
     except KeyboardInterrupt:
-        result = {"ok": False, "error": "Interrupted. If confirming a change, inspect server state before retrying.", "code": "imap_error"}
+        result = {"ok": False, "error": "Interrupted. If confirming a change, inspect server state before retrying.",
+                  "code": "smtp_error" if args is not None and args.command == "send" else "imap_error"}
         status = 130
     except Exception:
         # Do not expose tracebacks, server responses, config content, or credentials.
-        result = {"ok": False, "error": "Unexpected failure; details suppressed to protect credentials. If confirming a change, inspect server state before retrying.", "code": "imap_error"}
+        result = {"ok": False, "error": "Unexpected failure; details suppressed to protect credentials. If confirming a change, inspect server state before retrying.",
+                  "code": "smtp_error" if args is not None and args.command == "send" else "imap_error"}
         status = 1
     if text:
         output = render_text(result["data"]) if result["ok"] else f"Error ({result['code']}): {result['error']}"
+        if not result["ok"] and "data" in result:
+            output += "\n" + render_text(result["data"])
     else:
         output = json.dumps(result, ensure_ascii=True)
     try:
