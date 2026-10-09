@@ -29,5 +29,5 @@ build-backend = "uv_build"
 [tool.uv.build-backend]
 module-name = "gimail"
 module-root = ""
-source-include = ["gimail.py", "tests/*.py", "examples/accounts.json", "uv.lock"]
+source-include = ["gimail.py", "tests/*.py", "examples/accounts.json", "docs/*.md", "uv.lock"]
 source-exclude = [".env", ".env.*", "*.log", "/gimail/**/*.json", "/gimail/**/*.lock"]
