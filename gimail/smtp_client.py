@@ -1,6 +1,7 @@
 """Plain-text SMTP submission; previews never connect or resolve credentials."""
 from __future__ import annotations
 
+import base64
 import re
 import smtplib
 import ssl
@@ -52,6 +53,22 @@ def compose(sender, recipients, subject, body):
     return message, sender, recipients
 
 
+def authenticate(client, user, password):
+    if user.isascii() and password.isascii():
+        client.login(user, password)
+        return
+    # smtplib.login/auth encode SASL responses as ASCII; encode UTF-8 PLAIN ourselves.
+    client.ehlo_or_helo_if_needed()
+    if "PLAIN" not in client.esmtp_features.get("auth", "").upper().split():
+        raise GimailError("SMTP server must advertise AUTH PLAIN for non-ASCII credentials.", "auth_failed")
+    token = base64.b64encode(("\x00" + user + "\x00" + password).encode("utf-8")).decode("ascii")
+    code, _ = client.docmd("AUTH", "PLAIN " + token)
+    if code == 334:
+        code, _ = client.docmd(token)
+    if code not in (235, 503):
+        raise GimailError("SMTP authentication failed. Check the account's credentials.", "auth_failed")
+
+
 def send(account, sender, recipients, subject, body, confirm=False):
     if account.smtp_host is None:
         raise GimailError("SMTP is not configured. Set --smtp-host with account add/update, or GIMAIL_SMTP_HOST.", "smtp_error")
@@ -79,7 +96,7 @@ def send(account, sender, recipients, subject, body, confirm=False):
             client.ehlo()
             client.starttls(context=context)  # No credential transmission or fallback before verified TLS.
             client.ehlo()
-        client.login(account.user, password)
+        authenticate(client, account.user, password)
         submitting = True
         refused = client.send_message(message, from_addr=sender, to_addrs=recipients)
         # Never expose server diagnostics: they can echo credentials or mail content.
@@ -91,6 +108,12 @@ def send(account, sender, recipients, subject, body, confirm=False):
             raise GimailError("Some recipients were refused; others were accepted. Do not resend to accepted recipients.",
                               "partial_delivery", data=result)
         return result
+    except KeyboardInterrupt:
+        if submitting:
+            raise GimailError("Interrupted during SMTP submission with unknown delivery status. Inspect server state before retrying; resending can duplicate mail.",
+                              "delivery_unknown", 130, data={**result, "delivery": "unknown"}) from None
+        raise GimailError("Interrupted before SMTP submission; message was not submitted.",
+                          "smtp_error", 130, data={**result, "delivery": "not_sent"}) from None
     except smtplib.SMTPAuthenticationError:
         raise GimailError("SMTP authentication failed. Check the account's credentials.", "auth_failed") from None
     except (smtplib.SMTPRecipientsRefused, smtplib.SMTPSenderRefused, smtplib.SMTPDataError):
@@ -106,5 +129,5 @@ def send(account, sender, recipients, subject, body, confirm=False):
             # A failed QUIT/close after DATA acknowledgement must not turn success into a retryable error.
             try:
                 client.close()
-            except Exception:
+            except (Exception, KeyboardInterrupt):
                 pass

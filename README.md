@@ -231,7 +231,7 @@ gimail account update work --smtp-host smtp.example.org \
   --smtp-security starttls --smtp-port 587 --confirm
 ```
 
-Environment-only generic accounts need `GIMAIL_SMTP_HOST` alongside `GIMAIL_HOST`, `GIMAIL_USER`, and the password source. SMTP defaults to verified SSL/465; choose `GIMAIL_SMTP_SECURITY=starttls` for verified STARTTLS/587. SMTP does not support plaintext or downgrade fallback. Settings do not affect IMAP ports/security. On first SMTP setup the port defaults according to SMTP security; later updates preserve omitted fields, so change the port explicitly when switching security.
+Environment-only generic accounts need `GIMAIL_SMTP_HOST` alongside `GIMAIL_HOST`, `GIMAIL_USER`, and the password source. SMTP defaults to verified SSL/465; choose `GIMAIL_SMTP_SECURITY=starttls` for verified STARTTLS/587. SMTP does not support plaintext or downgrade fallback. ASCII credentials use the server's supported `smtplib` mechanisms; non-ASCII credentials require advertised `AUTH PLAIN` and are encoded as UTF-8 over TLS. Settings do not affect IMAP ports/security. On first SMTP setup the port defaults according to SMTP security; later updates preserve omitted fields, so change the port explicitly when switching security.
 
 ```sh
 # body.txt must contain plain UTF-8 text:
@@ -248,7 +248,7 @@ printf 'Hello from stdin.\n' | gimail send --account work \
 - The sender defaults to the account username; use `--from you@example.org` if the login is not an email address or to select a provider-authorized alias. Recipients use repeated `--to`; exact duplicates are removed. Addresses must be bare ASCII dot-atom addresses with DNS-style domains, not display names, quoted local parts, comma-separated lists, or SMTPUTF8 addresses. Unicode subject/body are supported. Subjects must be nonempty and contain no control characters.
 - Body input is required: `--body-file PATH` or `--body-stdin` (reads all stdin). No attachments, CC/BCC, HTML, reply/thread support, or custom message headers. `send` does not use an IMAP folder.
 - Confirmed success reports `delivery: accepted`, the accepted recipients, and the generated Message-ID; SMTP acceptance **does not prove inbox delivery**. Gimail does not append a Sent-folder copy; providers may save one themselves. No automatic retry is performed.
-- Partial acceptance exits `1` with `code: partial_delivery` and `data.accepted`/`data.refused`. Do not resend to accepted recipients. A refused submission reports `delivery: not_sent`. A disconnect/timeout during submission reports `code: delivery_unknown` and `delivery: unknown`; inspect server state before retrying to avoid duplicates. Raw SMTP responses are never printed.
+- Partial acceptance exits `1` with `code: partial_delivery` and `data.accepted`/`data.refused`. Do not resend to accepted recipients. A refused submission reports `delivery: not_sent`. A disconnect/timeout during submission reports `code: delivery_unknown` and `delivery: unknown`; inspect server state before retrying to avoid duplicates. An interrupt exits `130`; if it happens during submission, it also preserves `delivery_unknown` and the Message-ID for investigation. Raw SMTP responses are never printed.
 
 ## Commands
 
