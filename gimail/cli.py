@@ -279,7 +279,8 @@ def render_text(data):
         prefix = "DRY RUN" if data["dry_run"] else data["delivery"].upper()
         lines = [f"{prefix}: send via {data['account']}",
                  f"SMTP: {data['smtp_host']}:{data['smtp_port']} ({data['smtp_security']})", f"From: {data['from']}",
-                 "To: " + ", ".join(data["to"]), "Subject: " + data["subject"]]
+                 "To: " + ", ".join(data["to"]), "Subject: " + data["subject"],
+                 "Message-ID: " + data["message_id"]]
         if "accepted" in data:
             lines.extend(("Accepted: " + ", ".join(data["accepted"]), "Refused: " + ", ".join(data["refused"])))
         lines.extend(data[key] for key in ("note", "hint") if key in data)

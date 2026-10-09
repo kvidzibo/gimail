@@ -203,7 +203,8 @@ class CliTests(unittest.TestCase):
     def test_send_interruption_preserves_delivery_state_and_exit_130(self):
         os.environ.update(GIMAIL_SMTP_HOST='smtp.example.org', GIMAIL_USER='me@example.org')
         command = ('send', '--to', 'one@example.org', '--subject', 'Hello', '--body-stdin', '--confirm')
-        with patch('gimail.smtp_client.smtplib.SMTP_SSL') as factory:
+        with patch('gimail.smtp_client.smtplib.SMTP_SSL') as factory, \
+                patch('gimail.smtp_client.make_msgid', return_value='<submission@example.org>'):
             smtp = factory.return_value
             for phase, delivery, code in (('login', 'not_sent', 'smtp_error'),
                                            ('send_message', 'unknown', 'delivery_unknown')):
@@ -216,12 +217,17 @@ class CliTests(unittest.TestCase):
                     self.assertFalse(result['ok'])
                     self.assertEqual(result['code'], code)
                     self.assertEqual(result['data']['delivery'], delivery)
-                    self.assertTrue(result['data']['message_id'])
+                    self.assertEqual(result['data']['message_id'], '<submission@example.org>')
                     if phase == 'login':
                         smtp.send_message.assert_not_called()
                     else:
                         smtp.send_message.assert_called_once()
                     smtp.close.assert_called_once()
+                    with patch('sys.stdin', io.StringIO('Hello')):
+                        status, text = self.invoke(*command, '--text', text=True)
+                    self.assertEqual(status, 130)
+                    self.assertIn('Message-ID: <submission@example.org>', text)
+                    self.assertIn('Error (' + code + ')', text)
 
     def test_first_use_unread_via_env_no_config(self):
         status, result = self.invoke('list', '--unread', '--limit', '5')
