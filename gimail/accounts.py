@@ -18,6 +18,8 @@ from .keyring import lookup_password
 
 ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 SECURITIES = ("ssl", "starttls", "plain")
+SMTP_SECURITIES = ("ssl", "starttls")
+SMTP_FIELDS = ("smtp_host", "smtp_port", "smtp_security")
 CREDENTIAL_FIELDS = frozenset(("password_env", "password", "password_keyring"))
 
 
@@ -37,6 +39,9 @@ class Account:
     password_env: Optional[str] = None
     password: Optional[str] = field(default=None, repr=False)
     password_keyring: bool = False
+    smtp_host: Optional[str] = None
+    smtp_port: Optional[int] = None
+    smtp_security: Optional[str] = None
 
     @classmethod
     def from_record(cls, record):
@@ -63,7 +68,22 @@ class Account:
             raise GimailError("password_keyring must be a boolean.")
         if sum((password_env is not None, password is not None, password_keyring)) != 1:
             raise GimailError("Set exactly one credential source: password_env, password, or password_keyring=true.")
-        return cls(record["name"], record["host"], port, record["user"], security, password_env, password, password_keyring)
+        smtp_host = record.get("smtp_host")
+        smtp_security, smtp_port = record.get("smtp_security"), record.get("smtp_port")
+        if smtp_host is None:
+            if smtp_security is not None or smtp_port is not None:
+                raise GimailError("SMTP port/security require smtp_host.")
+        else:
+            if not clean_string(smtp_host):
+                raise GimailError("SMTP host must be nonempty without control characters.")
+            smtp_security = smtp_security if smtp_security is not None else "ssl"
+            if smtp_security not in SMTP_SECURITIES:
+                raise GimailError("SMTP security must be ssl or starttls; plaintext sending is not supported.")
+            smtp_port = smtp_port if smtp_port is not None else (465 if smtp_security == "ssl" else 587)
+            if type(smtp_port) is not int or not 1 <= smtp_port <= 65535:
+                raise GimailError("SMTP port must be an integer between 1 and 65535.")
+        return cls(record["name"], record["host"], port, record["user"], security, password_env, password,
+                   password_keyring, smtp_host, smtp_port, smtp_security)
 
     def public(self):
         result = {
@@ -74,10 +94,14 @@ class Account:
         }
         if self.password_env:
             result["password_env"] = self.password_env
+        if self.smtp_host is not None:
+            result.update({key: getattr(self, key) for key in SMTP_FIELDS})
         return result
 
     def record(self):
         result = {key: getattr(self, key) for key in ("name", "host", "port", "user", "security")}
+        if self.smtp_host is not None:
+            result.update({key: getattr(self, key) for key in SMTP_FIELDS})
         if self.password_keyring:
             result["password_keyring"] = True
         elif self.password_env:
@@ -199,7 +223,7 @@ def saved_account_index(accounts, name):
 
 
 def update_account(path, name, changes, make_default=False, confirm=False):
-    allowed = {"host", "port", "user", "security"} | CREDENTIAL_FIELDS
+    allowed = {"host", "port", "user", "security", *SMTP_FIELDS} | CREDENTIAL_FIELDS
     if not changes and not make_default:
         raise GimailError("No updates supplied. Provide an account field or --default.", exit_status=2)
     changed_sources = set(changes) & CREDENTIAL_FIELDS
@@ -265,10 +289,19 @@ def environment_account():
         port = int(os.environ.get("GIMAIL_PORT", "993" if security == "ssl" else "143"))
     except ValueError:
         raise GimailError("GIMAIL_PORT must be an integer between 1 and 65535.") from None
+    smtp_host = os.environ.get("GIMAIL_SMTP_HOST", "smtp.gmail.com" if preset == "gmail" else None)
+    smtp_port = os.environ.get("GIMAIL_SMTP_PORT")
+    if smtp_port is not None:
+        try:
+            smtp_port = int(smtp_port)
+        except ValueError:
+            raise GimailError("GIMAIL_SMTP_PORT must be an integer between 1 and 65535.") from None
     return Account.from_record({
         "name": "env", "host": host or ("imap.gmail.com" if preset == "gmail" else None),
         "port": port, "user": os.environ.get("GIMAIL_USER"), "security": security,
         "password_env": os.environ.get("GIMAIL_PASSWORD_ENV", "GIMAIL_PASSWORD"),
+        "smtp_host": smtp_host, "smtp_port": smtp_port,
+        "smtp_security": os.environ.get("GIMAIL_SMTP_SECURITY"),
     })
 
 

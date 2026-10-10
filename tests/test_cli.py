@@ -1,7 +1,10 @@
+import base64
 import contextlib
 import io
 import json
 import os
+import smtplib
+import ssl
 import tempfile
 import unittest
 from pathlib import Path
@@ -34,6 +37,197 @@ class CliTests(unittest.TestCase):
         self.assertEqual(errors.getvalue(), '')
         self.assertNotIn('never-print-this-secret', output.getvalue())
         return status, output.getvalue() if text else json.loads(output.getvalue())
+
+    def test_send_preview_confirmation_and_delivery_safety(self):
+        body = 'Hello ✓.\n\x1b[31mNot terminal instructions.\n'
+        body_path = Path(self.temp.name) / 'body.txt'
+        body_path.write_text(body, encoding='utf-8')
+        command = ('send', '--account', 'sender', '--to', 'one@example.org',
+                   '--to', 'two@example.org', '--to', 'one@example.org',
+                   '--subject', 'Hello ✓', '--body-file', str(body_path))
+        with patch('gimail.accounts.lookup_password', return_value='never-print-this-secret') as lookup, \
+                patch('gimail.smtp_client.smtplib.SMTP_SSL') as tls, \
+                patch('gimail.smtp_client.smtplib.SMTP') as starttls:
+            status, _ = self.invoke('account', 'add', 'sender', '--preset', 'gmail',
+                                    '--user', 'me@example.org', '--keyring')
+            self.assertEqual(status, 0)
+            status, preview = self.invoke(*command)
+            self.assertEqual(status, 0)
+            self.assertTrue(preview['data']['dry_run'])
+            self.assertEqual(preview['data']['body'], body)
+            self.assertEqual(preview['data']['to'], ['one@example.org', 'two@example.org'])
+            self.assertEqual(preview['data']['smtp_port'], 465)
+            self.assertEqual(preview['data']['delivery'], 'not_sent')
+            status, text = self.invoke(*command, '--text', text=True)
+            self.assertEqual(status, 0)
+            self.assertIn('DRY RUN', text)
+            self.assertNotIn('\x1b', text)
+            lookup.assert_not_called()
+            tls.assert_not_called()
+            starttls.assert_not_called()
+
+            for field, value in (('--from', ''), ('--from', 'me@example.org\r\nBcc: bad@example.org'),
+                                 ('--to', 'Name <bad@example.org>'), ('--to', 'a@example.org,b@example.org'),
+                                 ('--to', 'ü@example.org'), ('--subject', 'x\nBcc: bad@example.org')):
+                with self.subTest(field=field, value=value):
+                    status, result = self.invoke(*command, field, value, '--confirm')
+                    self.assertEqual(status, 2)
+                    self.assertFalse(result['ok'])
+            lookup.assert_not_called()
+            tls.assert_not_called()
+            starttls.assert_not_called()
+
+            smtp = tls.return_value
+            smtp.send_message.return_value = {}
+            smtp.close.side_effect = OSError('never-print-this-secret')
+            status, result = self.invoke(*command, '--confirm')
+            self.assertEqual(status, 0)  # Cleanup failure after acceptance must not trigger a retry.
+            self.assertEqual(result['data']['delivery'], 'accepted')
+            self.assertNotIn('body', result['data'])
+            self.assertEqual(smtp.send_message.call_count, 1)
+            message = smtp.send_message.call_args.args[0]
+            self.assertEqual(str(message['Subject']), 'Hello ✓')
+            self.assertEqual(message.get_content().replace('\r\n', '\n'), body)
+            self.assertTrue(message['Message-ID'])
+            self.assertTrue(message['Date'])
+            self.assertEqual(smtp.send_message.call_args.kwargs['from_addr'], 'me@example.org')
+            self.assertEqual(smtp.send_message.call_args.kwargs['to_addrs'], preview['data']['to'])
+            message.as_bytes().decode('ascii')  # Unicode content does not require SMTPUTF8/8BITMIME.
+            context = tls.call_args.kwargs['context']
+            self.assertTrue(context.check_hostname)
+            self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+            self.assertEqual(tls.call_args.args, ('smtp.gmail.com', 465))
+            smtp.login.assert_called_once_with('me@example.org', 'never-print-this-secret')
+            smtp.close.assert_called_once()
+
+            failures = (
+                ({'two@example.org': (550, b'never-print-this-secret')}, 'partial_delivery', 'partial'),
+                (smtplib.SMTPRecipientsRefused({'one@example.org': (550, b'never-print-this-secret')}), 'smtp_error', 'not_sent'),
+                (smtplib.SMTPDataError(554, b'never-print-this-secret'), 'smtp_error', 'not_sent'),
+                (smtplib.SMTPServerDisconnected('never-print-this-secret'), 'delivery_unknown', 'unknown'),
+            )
+            for failure, code, delivery in failures:
+                with self.subTest(code=code, delivery=delivery):
+                    smtp.reset_mock()
+                    smtp.send_message.side_effect = failure if isinstance(failure, Exception) else None
+                    smtp.send_message.return_value = failure if isinstance(failure, dict) else {}
+                    status, result = self.invoke(*command, '--confirm')
+                    self.assertEqual(status, 1)
+                    self.assertFalse(result['ok'])
+                    self.assertEqual(result['code'], code)
+                    self.assertEqual(result['data']['delivery'], delivery)
+                    smtp.send_message.assert_called_once()  # No blind retry, even on ambiguity.
+                    smtp.close.assert_called_once()
+                    if delivery == 'partial':
+                        self.assertEqual(result['data']['accepted'], ['one@example.org'])
+                        self.assertEqual(result['data']['refused'], ['two@example.org'])
+
+            # Stored settings round-trip; a previewed update cannot change the endpoint.
+            status, _ = self.invoke('account', 'update', 'sender', '--smtp-host', 'smtp.example.org',
+                                    '--smtp-security', 'starttls', '--smtp-port', '587')
+            self.assertEqual(status, 0)
+            saved = json.loads(self.path.read_text())['accounts'][0]
+            self.assertEqual(saved['smtp_security'], 'ssl')
+            status, _ = self.invoke('account', 'update', 'sender', '--smtp-host', 'smtp.example.org',
+                                    '--smtp-security', 'starttls', '--smtp-port', '587', '--confirm')
+            self.assertEqual(status, 0)
+            upgraded = starttls.return_value
+            upgraded.send_message.return_value = {}
+            for failure in (ssl.SSLError('never-print-this-secret'), None):
+                with self.subTest(starttls_failure=failure is not None):
+                    upgraded.reset_mock()
+                    upgraded.starttls.side_effect = failure
+                    status, result = self.invoke(*command, '--confirm')
+                    self.assertEqual(status, 1 if failure else 0)
+                    if failure:
+                        upgraded.login.assert_not_called()
+                        upgraded.send_message.assert_not_called()
+                    else:
+                        self.assertEqual([call[0] for call in upgraded.method_calls],
+                                         ['ehlo', 'starttls', 'ehlo', 'login', 'send_message', 'close'])
+                        context = upgraded.starttls.call_args.kwargs['context']
+                        self.assertTrue(context.check_hostname)
+                        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+
+            os.environ.update(GIMAIL_SMTP_HOST='smtp.example.net', GIMAIL_USER='env@example.net')
+            with patch('sys.stdin', io.StringIO('Body from stdin ✓')):
+                status, result = self.invoke('send', '--to', 'one@example.org', '--subject', 'Stdin', '--body-stdin')
+            self.assertEqual(status, 0)
+            self.assertEqual(result['data']['body'], 'Body from stdin ✓')
+            self.assertEqual(result['data']['smtp_host'], 'smtp.example.net')
+            self.assertEqual(result['data']['smtp_port'], 465)
+        self.assertEqual(self.fake.calls, [])  # SMTP send never opens an IMAP mailbox.
+
+    def test_send_authenticates_existing_unicode_credentials_with_utf8_plain(self):
+        os.environ.update(GIMAIL_SMTP_HOST='smtp.example.org', GIMAIL_USER='më@example.org',
+                          GIMAIL_PASSWORD='sëcret')
+        command = ('send', '--from', 'sender@example.org', '--to', 'one@example.org',
+                   '--subject', 'Hello', '--body-stdin', '--confirm')
+        with patch('gimail.smtp_client.smtplib.SMTP_SSL') as factory:
+            smtp = factory.return_value
+            smtp.esmtp_features = {'auth': 'PLAIN LOGIN'}
+            smtp.send_message.return_value = {}
+            for replies in ([(235, b'ok')], [(334, b''), (235, b'ok')]):
+                with self.subTest(challenge=len(replies) == 2), patch('sys.stdin', io.StringIO('Hello')):
+                    smtp.reset_mock()
+                    smtp.docmd.side_effect = replies
+                    status, result = self.invoke(*command)
+                    self.assertEqual(status, 0)
+                    self.assertEqual(result['data']['delivery'], 'accepted')
+                    smtp.login.assert_not_called()
+                    auth = smtp.docmd.call_args_list[0].args
+                    self.assertEqual(auth[0], 'AUTH')
+                    self.assertTrue(auth[1].startswith('PLAIN '))
+                    token = auth[1].split(' ', 1)[1]
+                    self.assertEqual(base64.b64decode(token).decode('utf-8'), '\x00më@example.org\x00sëcret')
+                    if len(replies) == 2:
+                        self.assertEqual(smtp.docmd.call_args_list[1].args, (token,))
+                    self.assertNotIn(token, json.dumps(result))
+                    self.assertNotIn('sëcret', json.dumps(result, ensure_ascii=False))
+
+            for mechanisms, reply in (('LOGIN', (235, b'ok')), ('PLAIN', (535, 'sëcret'.encode('utf-8')))):
+                with self.subTest(mechanisms=mechanisms), patch('sys.stdin', io.StringIO('Hello')):
+                    smtp.reset_mock()
+                    smtp.esmtp_features = {'auth': mechanisms}
+                    smtp.docmd.side_effect = None
+                    smtp.docmd.return_value = reply
+                    status, result = self.invoke(*command)
+                    self.assertEqual(status, 1)
+                    self.assertEqual(result['code'], 'auth_failed')
+                    self.assertNotIn('sëcret', json.dumps(result, ensure_ascii=False))
+                    smtp.send_message.assert_not_called()
+                    if mechanisms == 'LOGIN':
+                        smtp.docmd.assert_not_called()
+                    smtp.close.assert_called_once()
+
+    def test_send_interruption_preserves_delivery_state_and_exit_130(self):
+        os.environ.update(GIMAIL_SMTP_HOST='smtp.example.org', GIMAIL_USER='me@example.org')
+        command = ('send', '--to', 'one@example.org', '--subject', 'Hello', '--body-stdin', '--confirm')
+        with patch('gimail.smtp_client.smtplib.SMTP_SSL') as factory, \
+                patch('gimail.smtp_client.make_msgid', return_value='<submission@example.org>'):
+            smtp = factory.return_value
+            for phase, delivery, code in (('login', 'not_sent', 'smtp_error'),
+                                           ('send_message', 'unknown', 'delivery_unknown')):
+                with self.subTest(phase=phase), patch('sys.stdin', io.StringIO('Hello')):
+                    smtp.reset_mock()
+                    smtp.login.side_effect = KeyboardInterrupt if phase == 'login' else None
+                    smtp.send_message.side_effect = KeyboardInterrupt if phase == 'send_message' else None
+                    status, result = self.invoke(*command)
+                    self.assertEqual(status, 130)
+                    self.assertFalse(result['ok'])
+                    self.assertEqual(result['code'], code)
+                    self.assertEqual(result['data']['delivery'], delivery)
+                    self.assertEqual(result['data']['message_id'], '<submission@example.org>')
+                    if phase == 'login':
+                        smtp.send_message.assert_not_called()
+                    else:
+                        smtp.send_message.assert_called_once()
+                    smtp.close.assert_called_once()
+                    with patch('sys.stdin', io.StringIO('Hello')):
+                        status, text = self.invoke(*command, '--text', text=True)
+                    self.assertEqual(status, 130)
+                    self.assertIn('Message-ID: <submission@example.org>', text)
+                    self.assertIn('Error (' + code + ')', text)
 
     def test_first_use_unread_via_env_no_config(self):
         status, result = self.invoke('list', '--unread', '--limit', '5')
