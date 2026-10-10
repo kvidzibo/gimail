@@ -248,6 +248,22 @@ printf 'Hello from stdin.\n' | gimail send --account work \
 - Confirmed success reports `delivery: accepted`, the accepted recipients, and the generated Message-ID; SMTP acceptance **does not prove inbox delivery**. Gimail does not append a Sent-folder copy; providers may save one themselves. No automatic retry is performed.
 - Partial acceptance exits `1` with `code: partial_delivery` and `data.accepted`/`data.refused`. Do not resend to accepted recipients. A refused submission reports `delivery: not_sent`. A disconnect/timeout during submission reports `code: delivery_unknown` and `delivery: unknown`; inspect server state before retrying to avoid duplicates. An interrupt exits `130`; if it happens during submission, it also preserves `delivery_unknown` and the Message-ID for investigation. Raw SMTP responses are never printed.
 
+## Saving drafts
+
+`draft` uses IMAP to save a plain-text message for review, editing, and sending in Gmail or another mail client. It **never connects to SMTP or sends mail**, and does not require SMTP configuration. It accepts the same sender, recipients, subject, and body inputs as `send`, with the same validation and limitations (including a required recipient and nonempty subject).
+
+```sh
+gimail draft --account personal --to recipient@example.org \
+  --subject 'Please review' --body-file body.txt --text          # offline preview
+gimail draft --account personal --to recipient@example.org \
+  --subject 'Please review' --body-file body.txt --confirm       # save, not send
+```
+
+- Preview never connects or retrieves credentials. Its `folder: null` means discovery will happen when saving; it does not verify Drafts access. The preview includes the body; keep it private.
+- Confirmation lists mailboxes and finds one selectable special-use `\\Drafts` folder, including localized Gmail mailbox names. If none or multiple are advertised, it stops without saving. Override discovery with `--folder 'exact/mailbox/path'`; the folder must already exist. This flag is the **destination**, not a source mailbox. Gmail's Drafts label must be exposed to IMAP.
+- Saving appends a new message with the IMAP `\\Draft` flag, without selecting or expunging a mailbox. Successful output reports `saved: true`, the actual folder, and the generated Message-ID; review the draft in Gmail before sending. No automatic retry, replacement of existing drafts, attachment, CC/BCC, HTML, or reply/thread support.
+- Each confirmed invocation creates a **new** draft. A rejected APPEND reports `saved: false`; a disconnect, timeout, or interrupt during APPEND reports `code: draft_unknown`, `saved: null`, and the Message-ID. Inspect the destination before retrying to avoid duplicates; an interrupt exits `130`. Raw server diagnostics are suppressed.
+
 ## Commands
 
 ```text
@@ -270,9 +286,11 @@ gimail move UID FOLDER
 gimail delete UID
 gimail send --to ADDRESS [--to ADDRESS ...] --subject SUBJECT
             (--body-file PATH | --body-stdin) [--from ADDRESS] [--confirm]
+gimail draft --to ADDRESS [--to ADDRESS ...] --subject SUBJECT
+             (--body-file PATH | --body-stdin) [--from ADDRESS] [--folder FOLDER] [--confirm]
 ```
 
-Common flags can appear before or after the command where applicable: `--account NAME`, `--config PATH`, `--text`, `--confirm`. IMAP commands and `account test` also accept `--folder FOLDER` (source, default `INBOX`). Flag abbreviations are not accepted. `--help` on any command and `--version` intentionally produce plain text.
+Common flags can appear before or after the command where applicable: `--account NAME`, `--config PATH`, `--text`, `--confirm`. Reading/mutation IMAP commands and `account test` also accept `--folder FOLDER` (source, default `INBOX`); `draft` uses it as the destination (default: discover Drafts). Flag abbreviations are not accepted. `--help` on any command and `--version` intentionally produce plain text.
 
 ```sh
 gimail list --folder INBOX --account work --unread --limit 5
@@ -323,7 +341,7 @@ Failures have this envelope:
 {"ok": false, "error": "Message UID not found in this folder.", "code": "not_found"}
 ```
 
-Codes: `auth_failed` (credentials/authentication), `not_found` (account, folder, or UID absent/inaccessible), `imap_error` (configuration, arguments, IMAP, or other failure), `smtp_error` (SMTP/message validation or submission failure), `partial_delivery` (some recipients accepted), `delivery_unknown` (submission status uncertain). SMTP delivery errors can also include safe `data` context as described above. Operational/config errors exit `1`; parsing/usage errors exit `2`; an interrupt exits `130`. Raw server errors and tracebacks are suppressed because they can echo credentials. `--text` escapes terminal control characters in mail.
+Codes: `auth_failed` (credentials/authentication), `not_found` (account, folder, or UID absent/inaccessible), `imap_error` (configuration, arguments, IMAP, or other failure), `smtp_error` (SMTP/message validation or submission failure), `partial_delivery` (some recipients accepted), `delivery_unknown` (submission status uncertain), `draft_unknown` (draft save status uncertain). SMTP delivery and draft save errors can also include safe `data` context as described above. Operational/config errors exit `1`; parsing/usage errors exit `2`; an interrupt exits `130`. Raw server errors and tracebacks are suppressed because they can echo credentials. `--text` escapes terminal control characters in mail.
 
 An empty search is a successful empty array, not `not_found`. Messages disappearing between search and fetch are skipped, so fewer than the limit may be returned. Example using optional `jq` (not a gimail dependency):
 

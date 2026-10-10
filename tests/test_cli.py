@@ -1,7 +1,10 @@
 import base64
 import contextlib
 import io
+import imaplib
 import json
+from email import policy
+from email.parser import BytesParser
 import os
 import smtplib
 import ssl
@@ -37,6 +40,107 @@ class CliTests(unittest.TestCase):
         self.assertEqual(errors.getvalue(), '')
         self.assertNotIn('never-print-this-secret', output.getvalue())
         return status, output.getvalue() if text else json.loads(output.getvalue())
+
+    def test_draft_preview_save_discovery_and_failure_safety(self):
+        body = 'Review this ✓.\n\x1b[31mNot terminal instructions.\n'
+        body_path = Path(self.temp.name) / 'draft.txt'
+        body_path.write_text(body, encoding='utf-8')
+        command = ('draft', '--account', 'writer', '--to', 'one@example.org',
+                   '--to', 'one@example.org', '--subject', 'Draft ✓', '--body-file', str(body_path))
+        with patch('gimail.accounts.lookup_password', return_value='never-print-this-secret') as lookup, \
+                patch.object(self.fake, 'list', create=True) as listing, \
+                patch.object(self.fake, 'append', create=True, return_value=('OK', [b'saved'])) as append, \
+                patch('gimail.smtp_client.smtplib.SMTP_SSL') as smtp:
+            status, _ = self.invoke('account', 'add', 'writer', '--host', 'imap.example.org',
+                                    '--user', 'me@example.org', '--keyring')
+            self.assertEqual(status, 0)  # No SMTP setup required.
+            status, result = self.invoke(*command)
+            self.assertEqual(status, 0)
+            self.assertEqual(result['data']['body'], body)
+            self.assertEqual(result['data']['to'], ['one@example.org'])
+            self.assertIsNone(result['data']['folder'])
+            self.assertFalse(result['data']['saved'])
+            self.assertTrue(result['data']['dry_run'])
+            status, text = self.invoke(*command, '--text', text=True)
+            self.assertEqual(status, 0)
+            self.assertIn('DRY RUN: draft', text)
+            self.assertNotIn('\x1b', text)
+            lookup.assert_not_called()
+            self.assertEqual(self.fake.calls, [])
+            listing.assert_not_called()
+            append.assert_not_called()
+            for field, value in (('--from', 'bad\r\nBcc: x@example.org'), ('--to', 'bad'),
+                                 ('--subject', 'bad\nsubject'), ('--folder', 'bad\nfolder')):
+                with self.subTest(field=field):
+                    status, _ = self.invoke(*command, field, value, '--confirm')
+                    self.assertEqual(status, 2)
+            lookup.assert_not_called()
+            append.assert_not_called()
+
+            for rows, folder, target in (
+                ([b'(\\HasNoChildren \\Drafts) "/" "[Gmail]/Drafts"'], '[Gmail]/Drafts', '"[Gmail]/Drafts"'),
+                ([b'(\\drafts) NIL Drafts'], 'Drafts', '"Drafts"'),
+                ([(b'(\\Drafts) "/" {8}', b'&U,BTFw-'), b''], '台北', '"&U,BTFw-"'),
+                ([b'(\\Drafts) "/" "A &- B"'], 'A & B', '"A &- B"'),
+                ([b'(\\Drafts) "/" "A \\" B"'], 'A " B', '"A \\" B"'),
+            ):
+                with self.subTest(folder=folder):
+                    listing.return_value = 'OK', rows
+                    append.reset_mock()
+                    status, result = self.invoke(*command, '--confirm')
+                    self.assertEqual(status, 0, result)
+                    self.assertEqual(result['data']['folder'], folder)
+                    self.assertTrue(result['data']['saved'])
+                    self.assertNotIn('body', result['data'])
+                    append.assert_called_once()
+                    args = append.call_args.args
+                    self.assertEqual(args[:3], (target, r'(\Draft)', None))
+                    message = BytesParser(policy=policy.default).parsebytes(args[3])
+                    self.assertEqual(str(message['Subject']), 'Draft ✓')
+                    self.assertEqual(message.get_content().replace('\r\n', '\n'), body)
+                    self.assertEqual(str(message['Message-ID']), result['data']['message_id'])
+                    listing.assert_called_with('""', '"*"')
+            listing.reset_mock()
+            status, text = self.invoke('--folder', 'My Drafts', *command, '--confirm', '--text', text=True)
+            self.assertEqual(status, 0)
+            self.assertIn('SAVED: draft', text)
+            self.assertIn('Folder: My Drafts', text)
+            listing.assert_not_called()
+            self.assertEqual(append.call_args.args[0], '"My Drafts"')
+            self.assertFalse(any(call[0] == 'SELECT' for call in self.fake.calls))
+
+            for rows in ([b'(\\HasNoChildren) "/" "Drafts"'],
+                         [b'(\\Drafts \\Noselect) "/" "Drafts"'],
+                         [b'(\\Drafts) "/" "One"', b'(\\Drafts) "/" "Two"'],
+                         [(b'(\\Drafts) "/" {3}', b'too long')],
+                         [b'(\\Drafts) "/" "bad&name"']):
+                listing.return_value = 'OK', rows
+                append.reset_mock()
+                status, result = self.invoke(*command, '--confirm')
+                self.assertEqual(status, 1)
+                self.assertFalse(result['ok'])
+                append.assert_not_called()
+            append.side_effect = None
+            append.return_value = 'NO', [b'never-print-this-secret']
+            status, result = self.invoke(*command, '--folder', 'Drafts', '--confirm')
+            self.assertEqual(status, 1)
+            self.assertFalse(result['data']['saved'])
+            for failure in (OSError('never-print-this-secret'), imaplib.IMAP4.abort('secret'), KeyboardInterrupt()):
+                append.reset_mock()
+                append.side_effect = failure
+                status, result = self.invoke(*command, '--folder', 'Drafts', '--confirm')
+                self.assertEqual(status, 130 if isinstance(failure, KeyboardInterrupt) else 1)
+                self.assertEqual(result['code'], 'draft_unknown')
+                self.assertIsNone(result['data']['saved'])
+                self.assertTrue(result['data']['message_id'])
+                append.assert_called_once()  # No retry on uncertain saves.
+            append.side_effect = None
+            append.return_value = 'OK', [b'saved']
+            with patch.object(self.fake, 'logout', side_effect=KeyboardInterrupt()):
+                status, result = self.invoke(*command, '--folder', 'Drafts', '--confirm')
+                self.assertEqual(status, 0)  # A cleanup interrupt cannot undo acknowledgement.
+                self.assertTrue(result['data']['saved'])
+            smtp.assert_not_called()
 
     def test_send_preview_confirmation_and_delivery_safety(self):
         body = 'Hello ✓.\n\x1b[31mNot terminal instructions.\n'
