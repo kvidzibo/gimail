@@ -2,7 +2,7 @@
 
 A small, scriptable IMAP/SMTP client for humans and AI agents. It uses Python's standard library only: no Gmail API, cloud service, or runtime Python dependencies. Gmail is a preset, not a requirement.
 
-It reads mail as JSON (or human-readable text), supports UID-based listing, search, show, mark, move, and delete, and sends plain-text mail over verified SMTP TLS. Saved accounts may use environment variables, plaintext config, or optional GNOME Keyring credentials.
+It reads mail as JSON (or human-readable text), supports UID-based listing, search, show, mark, move, and delete, saves plain-text drafts over IMAP, and sends plain-text mail over verified SMTP TLS. Saved accounts may use environment variables, plaintext config, or optional GNOME Keyring credentials.
 
 ## Prerequisites and install
 
@@ -77,6 +77,17 @@ gimail send --to recipient@example.org --subject 'Hello' --body-file body.txt --
 ```
 
 Preview never connects or retrieves credentials. SMTP acceptance is not proof of inbox delivery, and gimail does not save a Sent-folder copy. Partial or unknown delivery needs investigation before retrying; resending can duplicate mail. No attachments, CC/BCC, HTML, or reply threading yet.
+
+## Saving drafts
+
+Save a message for review, editing, and sending in Gmail (or another IMAP mail client), without sending it from gimail. Uses the existing IMAP account; no SMTP setup is needed.
+
+```sh
+gimail draft --to recipient@example.org --subject 'Hello' --body-file body.txt --text
+gimail draft --to recipient@example.org --subject 'Hello' --body-file body.txt --confirm
+```
+
+Preview is offline. Confirmation discovers the server's special-use Drafts folder and appends the message with `\\Draft`; for servers without an unambiguous Drafts folder, specify `--folder 'Drafts'` using the actual mailbox path. Each save creates a new draft, not an update. If a save times out, inspect Drafts before retrying to avoid duplicates. See [draft details](docs/usage.md#saving-drafts).
 
 ## Changes and safety
 

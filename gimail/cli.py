@@ -12,6 +12,7 @@ from .accounts import (
     Account, SECURITIES, SMTP_FIELDS, SMTP_SECURITIES, add_account, config_path, environment_account,
     load_config, remove_account, select_account, update_account,
 )
+from .drafts import draft
 from .errors import GimailError
 from .imap_client import MailClient, mailbox
 from .smtp_client import send
@@ -59,7 +60,7 @@ def common(parser, account_config=False):
         (("--config",), dict(metavar="PATH", help="accounts config path (also GIMAIL_CONFIG)")),
         (("--account",), dict(metavar="NAME", help=account_help)),
         (("--folder",), dict(metavar="FOLDER", help="source mailbox (default: INBOX)")),
-        (("--confirm",), dict(action="store_true", help="send mail or apply mail mutations/account update/remove instead of previewing")),
+        (("--confirm",), dict(action="store_true", help="send mail, save drafts, or apply mail mutations/account update/remove instead of previewing")),
     ):
         if account_config and names == ("--folder",):
             continue
@@ -151,14 +152,19 @@ def build_parser():
     common(delete)
     delete.add_argument("uid", type=uid_value)
 
-    sending = commands.add_parser("send", help="preview sending plain-text mail; submit with --confirm")
-    common(sending, account_config=True)
-    sending.add_argument("--from", dest="sender", help="bare ASCII sender address (default: account user)")
-    sending.add_argument("--to", action="append", required=True, help="one bare ASCII recipient; repeat for multiple recipients")
-    sending.add_argument("--subject", required=True)
-    body = sending.add_mutually_exclusive_group(required=True)
-    body.add_argument("--body-file", metavar="PATH", help="read plain-text UTF-8 body from a file")
-    body.add_argument("--body-stdin", action="store_true", help="read plain-text UTF-8 body from stdin (all input)")
+    for command, help_text in (("send", "preview sending plain-text mail; submit with --confirm"),
+                               ("draft", "preview a plain-text draft; save via IMAP with --confirm (never sends)")):
+        composing = commands.add_parser(command, help=help_text)
+        common(composing, account_config=True)
+        if command == "draft":
+            composing.add_argument("--folder", default=argparse.SUPPRESS, metavar="FOLDER",
+                                   help="destination mailbox (default: discover special-use Drafts folder)")
+        composing.add_argument("--from", dest="sender", help="bare ASCII sender address (default: account user)")
+        composing.add_argument("--to", action="append", required=True, help="one bare ASCII recipient; repeat for multiple recipients")
+        composing.add_argument("--subject", required=True)
+        body = composing.add_mutually_exclusive_group(required=True)
+        body.add_argument("--body-file", metavar="PATH", help="read plain-text UTF-8 body from a file")
+        body.add_argument("--body-stdin", action="store_true", help="read plain-text UTF-8 body from stdin (all input)")
     return parser
 
 
@@ -231,7 +237,7 @@ def dispatch(args):
                 args.account = selected.name
             return remove_account(path, args.account, confirm=args.confirm, expected_account=selected)
 
-    if args.command == "send":
+    if args.command in ("send", "draft"):
         account = select_account(path, args.account)
         try:
             if args.body_stdin:
@@ -240,7 +246,10 @@ def dispatch(args):
             else:
                 body = Path(args.body_file).read_text(encoding="utf-8")
         except (OSError, UnicodeError):
-            raise GimailError("Cannot read body: expected an accessible UTF-8 file or stdin.", "smtp_error", 2) from None
+            raise GimailError("Cannot read body: expected an accessible UTF-8 file or stdin.",
+                              "smtp_error" if args.command == "send" else "imap_error", 2) from None
+        if args.command == "draft":
+            return draft(account, args.sender, args.to, args.subject, body, folder=args.folder, confirm=args.confirm)
         return send(account, args.sender, args.to, args.subject, body, confirm=args.confirm)
 
     mailbox(args.folder)  # Validate before opening a connection.
@@ -275,6 +284,16 @@ def terminal_safe(value, multiline=False):
 
 
 def render_text(data):
+    if data.get("action") == "draft":
+        prefix = "DRY RUN" if data["dry_run"] else ("SAVED" if data["saved"] else "UNKNOWN" if data["saved"] is None else "NOT SAVED")
+        lines = [f"{prefix}: draft via {data['account']}",
+                 "Folder: " + (data["folder"] or "(discover Drafts when saving)"),
+                 "From: " + data["from"], "To: " + ", ".join(data["to"]),
+                 "Subject: " + data["subject"], "Message-ID: " + data["message_id"]]
+        lines.extend(data[key] for key in ("note", "hint") if key in data)
+        if "body" in data:
+            lines.extend(("", data["body"]))
+        return terminal_safe("\n".join(lines), multiline=True)
     if data.get("action") == "send":
         prefix = "DRY RUN" if data["dry_run"] else data["delivery"].upper()
         lines = [f"{prefix}: send via {data['account']}",
@@ -340,7 +359,7 @@ def main(argv=None):
     args = None
     try:
         args = build_parser().parse_args(argv)
-        for key, default in (("text", False), ("config", None), ("account", None), ("folder", "INBOX"), ("confirm", False)):
+        for key, default in (("text", False), ("config", None), ("account", None), ("folder", None if args.command == "draft" else "INBOX"), ("confirm", False)):
             if not hasattr(args, key):
                 setattr(args, key, default)
         text = args.text

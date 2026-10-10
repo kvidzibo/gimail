@@ -175,10 +175,10 @@ class MailClient:
             try:
                 # CLOSE would expunge unrelated messages. LOGOUT does not.
                 self.connection.logout()
-            except Exception:
+            except (Exception, KeyboardInterrupt):
                 try:
                     self.connection.shutdown()
-                except Exception:
+                except (Exception, KeyboardInterrupt):
                     pass
             finally:
                 self.connection = None
