@@ -1,13 +1,17 @@
-"""Plain-text SMTP submission; previews never connect or resolve credentials."""
+"""SMTP submission with file attachments; previews never connect or resolve credentials."""
 from __future__ import annotations
 
 import base64
+import mimetypes
+import os
 import re
 import smtplib
 import ssl
+import stat
 from email.message import EmailMessage
 from email.policy import SMTP
 from email.utils import formatdate, make_msgid
+from pathlib import Path
 
 from .accounts import clean_string
 from .errors import GimailError
@@ -30,7 +34,7 @@ def address(value):
     return value
 
 
-def compose(sender, recipients, subject, body):
+def compose(sender, recipients, subject, body, attachments=()):
     sender = address(sender)
     recipients = list(dict.fromkeys(address(value) for value in recipients))
     if not recipients:
@@ -47,6 +51,23 @@ def compose(sender, recipients, subject, body):
         message["Date"] = formatdate(localtime=False, usegmt=True)
         message["Message-ID"] = make_msgid(domain=sender.split("@", 1)[1])
         message.set_content(body, charset="utf-8", cte="quoted-printable")
+        for source in attachments:
+            path = Path(source)
+            if not clean_string(path.name):
+                raise GimailError("Attachment filenames must be nonempty without control characters.", "smtp_error", 2)
+            try:
+                # Nonblocking open + fstat rejects FIFOs/devices without waiting for data.
+                with os.fdopen(os.open(path, os.O_RDONLY | os.O_NONBLOCK), "rb") as stream:
+                    if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                        raise GimailError("Attachments must be readable regular files.", "smtp_error", 2)
+                    payload = stream.read()
+            except OSError:
+                raise GimailError("Cannot read attachment: expected an accessible regular file.", "smtp_error", 2) from None
+            content_type, encoding = mimetypes.guess_type(path.name)
+            if content_type is None or encoding is not None:
+                content_type = "application/octet-stream"
+            maintype, subtype = content_type.split("/", 1)
+            message.add_attachment(payload, maintype=maintype, subtype=subtype, filename=path.name)
         message.as_bytes()  # Validate encoding before any connection or keyring lookup.
     except (ValueError, UnicodeError):
         raise GimailError("Message cannot be encoded as UTF-8 email.", "smtp_error", 2) from None
@@ -69,20 +90,22 @@ def authenticate(client, user, password):
         raise GimailError("SMTP authentication failed. Check the account's credentials.", "auth_failed")
 
 
-def send(account, sender, recipients, subject, body, confirm=False):
+def send(account, sender, recipients, subject, body, confirm=False, attachments=()):
     if account.smtp_host is None:
         raise GimailError("SMTP is not configured. Set --smtp-host with account add/update, or GIMAIL_SMTP_HOST.", "smtp_error")
-    message, sender, recipients = compose(account.user if sender is None else sender, recipients, subject, body)
+    message, sender, recipients = compose(account.user if sender is None else sender, recipients, subject, body, attachments)
     result = {
         "action": "send", "account": account.name, "dry_run": not confirm,
         "smtp_host": account.smtp_host, "smtp_port": account.smtp_port,
         "smtp_security": account.smtp_security,
         "from": sender, "to": recipients, "subject": subject,
         "message_id": str(message["Message-ID"]),
+        "attachments": [{"filename": part.get_filename(), "content_type": part.get_content_type(),
+                         "size": len(part.get_payload(decode=True))} for part in message.iter_attachments()],
     }
     if not confirm:
         return {**result, "body": body, "delivery": "not_sent",
-                "hint": "Review recipients and body, then re-run with the same input and --confirm. Preview does not test SMTP access."}
+                "hint": "Review recipients, body and attachments, then re-run with the same input and --confirm. Preview does not test SMTP access."}
 
     client = None
     submitting = False

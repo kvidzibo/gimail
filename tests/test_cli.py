@@ -262,6 +262,116 @@ class CliTests(unittest.TestCase):
             self.assertEqual(result['data']['smtp_port'], 465)
         self.assertEqual(self.fake.calls, [])  # SMTP send never opens an IMAP mailbox.
 
+    def test_send_attachments_preview_mime_and_local_file_safety(self):
+        body = 'Unchanged plain UTF-8 body ✓.\n'
+        body_path = Path(self.temp.name) / 'body.txt'
+        body_path.write_text(body, encoding='utf-8')
+        png = base64.b64decode(
+            'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aS1sAAAAASUVORK5CYII=')
+        files = (
+            ('image café.png', 'image/png', png),
+            ('opaque.gimail_unknown', 'application/octet-stream', b'PRIVATE-ATTACHMENT\x00\xff\n'),
+            ('archive.txt.gz', 'application/octet-stream', b'\x1f\x8bPRIVATE-COMPRESSED'),
+        )
+        command = ('send', '--account', 'sender', '--to', 'one@example.org',
+                   '--subject', 'Attachments ✓', '--body-file', str(body_path))
+        attach_args = []
+        metadata = []
+        for filename, content_type, payload in files:
+            path = Path(self.temp.name) / filename
+            path.write_bytes(payload)
+            attach_args.extend(('--attach', str(path)))
+            metadata.append({'filename': filename, 'content_type': content_type, 'size': len(payload)})
+        with patch('gimail.accounts.lookup_password', return_value='never-print-this-secret') as lookup, \
+                patch('gimail.smtp_client.smtplib.SMTP_SSL') as tls, \
+                patch('gimail.smtp_client.smtplib.SMTP') as starttls:
+            status, _ = self.invoke('account', 'add', 'sender', '--preset', 'gmail',
+                                    '--user', 'me@example.org', '--keyring')
+            self.assertEqual(status, 0)
+            status, preview = self.invoke(*command, *attach_args)
+            self.assertEqual(status, 0, preview)
+            self.assertTrue(preview['data']['dry_run'])
+            self.assertEqual(preview['data']['delivery'], 'not_sent')
+            self.assertEqual(preview['data']['body'], body)
+            self.assertEqual(preview['data']['attachments'], metadata)
+            status, text = self.invoke(*command, *attach_args, '--text', text=True)
+            self.assertEqual(status, 0)
+            self.assertIn('DRY RUN', text)
+            for item in metadata:
+                self.assertIn(item['filename'], text)
+                self.assertIn(item['content_type'], text)
+                self.assertIn(str(item['size']), text)
+            for output in (text, json.dumps(preview, ensure_ascii=False)):
+                self.assertNotIn(self.temp.name, output)
+                self.assertNotIn('PRIVATE-ATTACHMENT', output)
+                self.assertNotIn('PRIVATE-COMPRESSED', output)
+                for _, _, payload in files:
+                    self.assertNotIn(base64.b64encode(payload).decode('ascii'), output)
+            lookup.assert_not_called()
+            tls.assert_not_called()
+            starttls.assert_not_called()
+            status, rejected = self.invoke('draft', '--to', 'one@example.org',
+                                           '--subject', 'No draft attachments',
+                                           '--body-file', str(body_path), *attach_args)
+            self.assertEqual(status, 2)
+            self.assertFalse(rejected['ok'])
+
+            missing = Path(self.temp.name) / 'missing.png'
+            control = Path(self.temp.name) / 'bad\nname.png'
+            control.write_bytes(png)
+            invalid = [Path(self.temp.name), missing, control]
+            if hasattr(os, 'mkfifo'):
+                fifo = Path(self.temp.name) / 'pipe.png'
+                os.mkfifo(fifo)
+                invalid.append(fifo)
+            for path in invalid:
+                with self.subTest(invalid=path.name):
+                    status, result = self.invoke(*command, '--attach', str(path), '--confirm')
+                    self.assertEqual(status, 2, result)
+                    self.assertFalse(result['ok'])
+                    self.assertEqual(result['code'], 'smtp_error')
+            # Permission checks must be exercised even when tests run as root.
+            unreadable = Path(self.temp.name) / files[0][0]
+            real_open = os.open
+
+            def deny_attachment(path, *args, **kwargs):
+                if Path(path) == unreadable:
+                    raise PermissionError('attachment is unreadable')
+                return real_open(path, *args, **kwargs)
+
+            with patch('gimail.smtp_client.os.open', side_effect=deny_attachment):
+                status, result = self.invoke(*command, '--attach', str(unreadable), '--confirm')
+                self.assertEqual(status, 2, result)
+                self.assertEqual(result['code'], 'smtp_error')
+            lookup.assert_not_called()
+            tls.assert_not_called()
+            starttls.assert_not_called()
+
+            smtp = tls.return_value
+            smtp.send_message.return_value = {}
+            status, result = self.invoke(*command, *attach_args, '--confirm')
+            self.assertEqual(status, 0, result)
+            self.assertEqual(result['data']['delivery'], 'accepted')
+            self.assertEqual(result['data']['attachments'], metadata)
+            smtp.send_message.assert_called_once()
+            message = BytesParser(policy=policy.default).parsebytes(
+                smtp.send_message.call_args.args[0].as_bytes())
+            self.assertEqual(message.get_content_type(), 'multipart/mixed')
+            parts = list(message.iter_parts())
+            self.assertEqual(len(parts), 1 + len(files))
+            self.assertEqual(parts[0].get_content_type(), 'text/plain')
+            self.assertEqual(parts[0].get_content_charset(), 'utf-8')
+            self.assertEqual(parts[0].get_content().replace('\r\n', '\n'), body)
+            for part, (filename, content_type, payload) in zip(parts[1:], files):
+                self.assertEqual(part.get_content_disposition(), 'attachment')
+                self.assertEqual(part.get_filename(), filename)
+                self.assertEqual(part.get_content_type(), content_type)
+                self.assertEqual(part.get_payload(decode=True), payload)
+                self.assertNotIn(self.temp.name, str(part['Content-Disposition']))
+            lookup.assert_called_once()
+            starttls.assert_not_called()
+        self.assertEqual(self.fake.calls, [])
+
     def test_send_authenticates_existing_unicode_credentials_with_utf8_plain(self):
         os.environ.update(GIMAIL_SMTP_HOST='smtp.example.org', GIMAIL_USER='më@example.org',
                           GIMAIL_PASSWORD='sëcret')

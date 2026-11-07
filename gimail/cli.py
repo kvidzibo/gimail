@@ -152,7 +152,7 @@ def build_parser():
     common(delete)
     delete.add_argument("uid", type=uid_value)
 
-    for command, help_text in (("send", "preview sending plain-text mail; submit with --confirm"),
+    for command, help_text in (("send", "preview sending mail with optional attachments; submit with --confirm"),
                                ("draft", "preview a plain-text draft; save via IMAP with --confirm (never sends)")):
         composing = commands.add_parser(command, help=help_text)
         common(composing, account_config=True)
@@ -162,6 +162,9 @@ def build_parser():
         composing.add_argument("--from", dest="sender", help="bare ASCII sender address (default: account user)")
         composing.add_argument("--to", action="append", required=True, help="one bare ASCII recipient; repeat for multiple recipients")
         composing.add_argument("--subject", required=True)
+        if command == "send":
+            composing.add_argument("--attach", action="append", default=[], metavar="PATH",
+                                   help="attach a local file; repeat for multiple attachments")
         body = composing.add_mutually_exclusive_group(required=True)
         body.add_argument("--body-file", metavar="PATH", help="read plain-text UTF-8 body from a file")
         body.add_argument("--body-stdin", action="store_true", help="read plain-text UTF-8 body from stdin (all input)")
@@ -250,7 +253,7 @@ def dispatch(args):
                               "smtp_error" if args.command == "send" else "imap_error", 2) from None
         if args.command == "draft":
             return draft(account, args.sender, args.to, args.subject, body, folder=args.folder, confirm=args.confirm)
-        return send(account, args.sender, args.to, args.subject, body, confirm=args.confirm)
+        return send(account, args.sender, args.to, args.subject, body, confirm=args.confirm, attachments=args.attach)
 
     mailbox(args.folder)  # Validate before opening a connection.
     if args.command == "move":
@@ -300,6 +303,10 @@ def render_text(data):
                  f"SMTP: {data['smtp_host']}:{data['smtp_port']} ({data['smtp_security']})", f"From: {data['from']}",
                  "To: " + ", ".join(data["to"]), "Subject: " + data["subject"],
                  "Message-ID: " + data["message_id"]]
+        if data.get("attachments"):
+            lines.append("Attachments:")
+            lines.extend(f"- {part['filename']} ({part['content_type']}, {part['size']} bytes)"
+                         for part in data["attachments"])
         if "accepted" in data:
             lines.extend(("Accepted: " + ", ".join(data["accepted"]), "Refused: " + ", ".join(data["refused"])))
         lines.extend(data[key] for key in ("note", "hint") if key in data)
