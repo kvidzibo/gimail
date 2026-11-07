@@ -2,7 +2,7 @@
 
 A small, scriptable IMAP/SMTP client for humans and AI agents. It uses Python's standard library only: no Gmail API, cloud service, or runtime Python dependencies. Gmail is a preset, not a requirement.
 
-It reads mail as JSON (or human-readable text), supports UID-based listing, search, show, mark, move, and delete, saves plain-text drafts over IMAP, and sends plain-text mail over verified SMTP TLS. Saved accounts may use environment variables, plaintext config, or optional GNOME Keyring credentials.
+It reads mail as JSON (or human-readable text), supports UID-based listing, search, show, mark, move, and delete, saves plain-text drafts over IMAP, and sends plain-text mail with optional file attachments over verified SMTP TLS. Saved accounts may use environment variables, plaintext config, or optional GNOME Keyring credentials.
 
 ## Prerequisites and install
 
@@ -74,9 +74,11 @@ SMTP has separate host/port/security settings but uses the account's same login 
 gimail send --to recipient@example.org --subject 'Hello' --body-file body.txt --text
 # After reviewing the preview, repeat the same input to submit:
 gimail send --to recipient@example.org --subject 'Hello' --body-file body.txt --confirm
+# Attach files (preview first; add --confirm to submit the same input):
+gimail send --to recipient@example.org --subject 'Diagram' --body-file body.txt --attach diagram.png
 ```
 
-Preview never connects or retrieves credentials. SMTP acceptance is not proof of inbox delivery, and gimail does not save a Sent-folder copy. Partial or unknown delivery needs investigation before retrying; resending can duplicate mail. No attachments, CC/BCC, HTML, or reply threading yet.
+Use repeated `--attach PATH` for multiple readable local files. Preview reads them and lists filenames, MIME types and byte sizes, never file contents; only basenames are sent. Attachment types are inferred from extensions, with binary fallback. Files are held in memory and MIME encoding increases message size; provider limits still apply. Preview never connects or retrieves credentials. SMTP acceptance is not proof of inbox delivery, and gimail does not save a Sent-folder copy. Partial or unknown delivery needs investigation before retrying; resending can duplicate mail. No CC/BCC, HTML body, or reply threading yet. Drafts remain plain-text only.
 
 ## Saving drafts
 

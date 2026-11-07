@@ -242,15 +242,17 @@ printf 'Hello from stdin.\n' | gimail send --account work \
   --to one@example.org --to two@example.org --subject 'Hello' --body-stdin
 ```
 
-- **Preview never connects, sends, or retrieves credentials.** Review its SMTP endpoint, sender, recipients, subject, and body before repeating the same input with `--confirm`. It does not test connectivity, authentication, or provider sender permissions. Changed files/settings between invocations change the message; a preview is not a reservation. Preview output contains the body: keep it private.
+- **Preview never connects, sends, or retrieves credentials.** Review its SMTP endpoint, sender, recipients, subject, body and attachment metadata before repeating the same input with `--confirm`. It does not test connectivity, authentication, or provider sender permissions. Changed files/settings between invocations change the message; a preview is not a reservation. Preview output contains the body: keep it private.
 - The sender defaults to the account username; use `--from you@example.org` if the login is not an email address or to select a provider-authorized alias. Recipients use repeated `--to`; exact duplicates are removed. Addresses must be bare ASCII dot-atom addresses with DNS-style domains, not display names, quoted local parts, comma-separated lists, or SMTPUTF8 addresses. Unicode subject/body are supported. Subjects must be nonempty and contain no control characters.
-- Body input is required: `--body-file PATH` or `--body-stdin` (reads all stdin). No attachments, CC/BCC, HTML, reply/thread support, or custom message headers. `send` does not use an IMAP folder.
+- Body input is required: `--body-file PATH` or `--body-stdin` (reads all stdin). Add `--attach diagram.png` or repeat `--attach PATH` for multiple files. Files must be readable regular files with control-free basenames; missing files, directories and special files are rejected before credential lookup or SMTP. Symlinks to regular files are accepted. MIME attachments retain the basename (including Unicode), not the local directory. Types are guessed from extensions; unknown or compressed formats use `application/octet-stream`. No content sniffing or conversion is performed.
+- Preview and submission results include `attachments` entries with `filename`, `content_type` and decoded byte `size` (an empty list when absent). Attachment payloads are not printed. Each invocation reads the files again; changing them after preview changes what is sent. Files and the MIME message are held in memory; encoding adds overhead and provider size limits apply. Keep preview output private because filenames may be sensitive.
+- No CC/BCC, HTML body, reply/thread support, or custom message headers. `send` does not use an IMAP folder.
 - Confirmed success reports `delivery: accepted`, the accepted recipients, and the generated Message-ID; SMTP acceptance **does not prove inbox delivery**. Gimail does not append a Sent-folder copy; providers may save one themselves. No automatic retry is performed.
 - Partial acceptance exits `1` with `code: partial_delivery` and `data.accepted`/`data.refused`. Do not resend to accepted recipients. A refused submission reports `delivery: not_sent`. A disconnect/timeout during submission reports `code: delivery_unknown` and `delivery: unknown`; inspect server state before retrying to avoid duplicates. An interrupt exits `130`; if it happens during submission, it also preserves `delivery_unknown` and the Message-ID for investigation. Raw SMTP responses are never printed.
 
 ## Saving drafts
 
-`draft` uses IMAP to save a plain-text message for review, editing, and sending in Gmail or another mail client. It **never connects to SMTP or sends mail**, and does not require SMTP configuration. It accepts the same sender, recipients, subject, and body inputs as `send`, with the same validation and limitations (including a required recipient and nonempty subject).
+`draft` uses IMAP to save a plain-text message for review, editing, and sending in Gmail or another mail client. It **never connects to SMTP or sends mail**, and does not require SMTP configuration. It accepts the same sender, recipients, subject, and body inputs as `send`, with the same validation (including a required recipient and nonempty subject), but does not accept `--attach`.
 
 ```sh
 gimail draft --account personal --to recipient@example.org \
@@ -285,7 +287,7 @@ gimail mark UID (--read | --unread)
 gimail move UID FOLDER
 gimail delete UID
 gimail send --to ADDRESS [--to ADDRESS ...] --subject SUBJECT
-            (--body-file PATH | --body-stdin) [--from ADDRESS] [--confirm]
+            (--body-file PATH | --body-stdin) [--attach PATH ...] [--from ADDRESS] [--confirm]
 gimail draft --to ADDRESS [--to ADDRESS ...] --subject SUBJECT
              (--body-file PATH | --body-stdin) [--from ADDRESS] [--folder FOLDER] [--confirm]
 ```
